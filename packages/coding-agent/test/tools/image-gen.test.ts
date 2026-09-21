@@ -1,5 +1,8 @@
 import { afterAll, describe, expect, it } from "bun:test";
+import * as os from "node:os";
+import * as path from "node:path";
 import { type Api, type FetchImpl, type Model } from "@oh-my-pi/pi-ai";
+import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { modelKind } from "@oh-my-pi/pi-catalog/types";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -12,11 +15,16 @@ import {
 	imageGenTool,
 } from "@oh-my-pi/pi-coding-agent/tools/image-gen";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import type { FormData } from "undici-types";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const generatedImagePaths: string[] = [];
 const PNG_DATA = Buffer.from("catalog-image").toString("base64");
 const WEBP_DATA = Buffer.from("hosted-image").toString("base64");
+
+// Complete 1x1 PNG and GIF images, also used for path-based MIME detection.
+const PNG_FIXTURE_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+const GIF_FIXTURE_B64 = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==";
 
 afterAll(async () => {
 	await Promise.all(generatedImagePaths.map(imagePath => removeWithRetries(imagePath)));
@@ -59,11 +67,16 @@ function createContext(options: {
 	fetch: FetchImpl;
 	activeModel?: Model<Api>;
 	credentials?: Record<string, string | undefined>;
+	configuredHeaders?: Record<string, string>;
 }): CustomToolContext {
+	const modelRegistry = createRegistry(options.models, options.credentials);
+	const { configuredHeaders } = options;
+	// Reuse the record so edits cannot silently mutate later generation headers.
+	if (configuredHeaders) modelRegistry.resolveModelHeaders = async () => configuredHeaders;
 	return {
 		fetch: options.fetch,
 		sessionManager: SessionManager.inMemory("/tmp"),
-		modelRegistry: createRegistry(options.models, options.credentials),
+		modelRegistry,
 		model: options.activeModel,
 		settings: options.settings,
 		isIdle: () => true,
@@ -72,8 +85,8 @@ function createContext(options: {
 	};
 }
 
-function imageResponse(mediaType = "image/png"): Response {
-	return new Response(JSON.stringify({ data: [{ b64_json: PNG_DATA, media_type: mediaType }] }), {
+function imageResponse(mediaType = "image/png", data = PNG_DATA): Response {
+	return new Response(JSON.stringify({ data: [{ b64_json: data, media_type: mediaType }] }), {
 		status: 200,
 		headers: { "content-type": "application/json" },
 	});
@@ -97,6 +110,62 @@ function hostedResponse(): Response {
 
 function collectPaths(result: CustomToolResult<{ imagePaths: string[] }>): void {
 	generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+}
+
+type CapturedBody = { kind: "json"; value: unknown } | { kind: "multipart"; form: FormData };
+
+interface CapturedRequest {
+	url: string;
+	method: string;
+	headers: Headers;
+	body: CapturedBody;
+}
+
+function recordRequests(respond: () => Response = () => imageResponse("image/png", PNG_FIXTURE_B64)): {
+	fetch: FetchImpl;
+	requests: CapturedRequest[];
+} {
+	const requests: CapturedRequest[] = [];
+	const fetchImpl: FetchImpl = async (input, init) => {
+		// Serialize and parse the wire body, not the original FormData object.
+		const request = input instanceof Request ? new Request(input, init) : new Request(input.toString(), init);
+		const body: CapturedBody = request.headers.get("content-type")?.startsWith("multipart/form-data")
+			? { kind: "multipart", form: await request.formData() }
+			: { kind: "json", value: await request.json() };
+		requests.push({
+			url: request.url,
+			method: request.method,
+			headers: request.headers,
+			body,
+		});
+		return respond();
+	};
+	return { fetch: fetchImpl, requests };
+}
+
+function jsonBody(request: CapturedRequest | undefined): unknown {
+	if (!request) throw new Error("Expected a recorded request");
+	if (request.body.kind !== "json") throw new Error(`Expected a JSON request body, got ${request.body.kind}`);
+	return request.body.value;
+}
+
+function multipartBody(request: CapturedRequest | undefined): FormData {
+	if (!request) throw new Error("Expected a recorded request");
+	if (request.body.kind !== "multipart")
+		throw new Error(`Expected a multipart request body, got ${request.body.kind}`);
+	return request.body.form;
+}
+
+async function formFiles(form: FormData, key: string): Promise<Array<{ type: string; base64: string }>> {
+	const files: Array<{ type: string; base64: string }> = [];
+	for (const entry of form.getAll(key)) {
+		if (!(entry instanceof File)) throw new Error(`Expected ${key} entries to be files, got ${typeof entry}`);
+		files.push({
+			type: entry.type,
+			base64: Buffer.from(await entry.arrayBuffer()).toString("base64"),
+		});
+	}
+	return files;
 }
 
 describe("imageGenTool catalog routing", () => {
@@ -249,36 +318,228 @@ describe("imageGenTool catalog routing", () => {
 		expect(calls).toBe(1);
 	});
 
-	it("uses the selected openai-images model and falls back from missing edits to generations", async () => {
+	it("aggregates a standard edit 404 without retrying as generation or inventing a size", async () => {
 		const model = catalogModel("deepinfra", "flux-selected", "openai-images");
-		const urls: string[] = [];
-		const bodies: Array<Record<string, unknown>> = [];
-		const fetchMock: FetchImpl = async (input, init) => {
-			urls.push(input.toString());
-			bodies.push(JSON.parse(String(init?.body)));
-			if (urls.length === 1) return new Response("missing edits", { status: 404 });
-			return imageResponse();
-		};
+		const transport = recordRequests(
+			() =>
+				new Response(JSON.stringify({ error: { message: "missing edits" } }), {
+					status: 404,
+					headers: { "content-type": "application/json" },
+				}),
+		);
 		const settings = Settings.isolated({ modelRoles: { image: "deepinfra/flux-selected" } });
-		const ctx = createContext({ models: [model], settings, fetch: fetchMock });
+		const ctx = createContext({ models: [model], settings, fetch: transport.fetch });
+		let failure: unknown;
+		try {
+			const result = await imageGenTool.execute(
+				"edit-404",
+				{ subject: "edit reference", input: [{ data: `data:image/png;base64,${PNG_FIXTURE_B64}` }] },
+				undefined,
+				ctx,
+			);
+			collectPaths(result);
+		} catch (error) {
+			failure = error;
+		}
 
+		expect(failure).toBeInstanceOf(AggregateError);
+		if (!(failure instanceof AggregateError)) throw new Error("Expected an exhausted image chain");
+		const errors: readonly unknown[] = failure.errors;
+		expect(errors).toHaveLength(1);
+		expect(errors[0]).toBeInstanceOf(ProviderHttpError);
+		expect(errors[0]).toMatchObject({ status: 404, message: expect.stringContaining("missing edits") });
+		expect(transport.requests.map(request => request.url)).toEqual(["https://deepinfra.example/v1/images/edits"]);
+		const request = transport.requests[0];
+		expect(request?.method).toBe("POST");
+		expect(request?.headers.get("content-type")).toMatch(/^multipart\/form-data;\s*boundary=.+$/);
+		const form = multipartBody(request);
+		expect([...form.keys()].sort()).toEqual(["image[]", "model", "n", "prompt"]);
+		expect(form.get("model")).toBe("flux-selected");
+		expect(form.get("prompt")).toContain("edit reference");
+		expect(form.get("n")).toBe("1");
+		expect(form.get("size")).toBeNull();
+		expect(await formFiles(form, "image[]")).toEqual([{ type: "image/png", base64: PNG_FIXTURE_B64 }]);
+	});
+
+	it("keeps all custom-provider multipart references and headers intact for subsequent JSON generation", async () => {
+		const model = catalogModel("custom-lb", "selected-image", "openai-images");
+		const bearer = "synthetic-custom-lb-image-token";
+		const configuredHeaders = {
+			"cOnTeNt-TyPe": "application/json; charset=utf-8",
+			"X-LB-Route": "image-pool",
+			"X-Request-Tag": "multipart-regression",
+			Authorization: "Bearer ignored-configured-image-token",
+		};
+		const originalHeaders = { ...configuredHeaders };
+		const transport = recordRequests();
+		const ctx = createContext({
+			models: [model],
+			settings: Settings.isolated({ modelRoles: { image: "custom-lb/selected-image" } }),
+			fetch: transport.fetch,
+			credentials: { "custom-lb": bearer },
+			configuredHeaders,
+		});
+		const inputPath = path.join(os.tmpdir(), `omp-image-gen-input-${crypto.randomUUID()}.gif`);
+		try {
+			await Bun.write(inputPath, Buffer.from(GIF_FIXTURE_B64, "base64"));
+			const edited = await imageGenTool.execute(
+				"custom-edit",
+				{
+					subject: "combine all references",
+					image_size: "1024x1536",
+					input: [
+						{ path: inputPath },
+						{ data: `data:image/png;base64,${PNG_FIXTURE_B64}` },
+						{ data: GIF_FIXTURE_B64, mime_type: "image/gif" },
+						{ data: PNG_FIXTURE_B64, mime_type: "image/png" },
+					],
+				},
+				undefined,
+				ctx,
+			);
+			collectPaths(edited);
+			expect(configuredHeaders).toEqual(originalHeaders);
+			const generated = await imageGenTool.execute(
+				"custom-generation",
+				{ subject: "generate without references" },
+				undefined,
+				ctx,
+			);
+			collectPaths(generated);
+
+			expect(transport.requests.map(request => request.url)).toEqual([
+				"https://custom-lb.example/v1/images/edits",
+				"https://custom-lb.example/v1/images/generations",
+			]);
+			const [edit, generation] = transport.requests;
+			expect(edit?.headers.get("content-type")).toMatch(/^multipart\/form-data;\s*boundary=.+$/);
+			const form = multipartBody(edit);
+			expect([...form.keys()].sort()).toEqual([
+				"image[]",
+				"image[]",
+				"image[]",
+				"image[]",
+				"model",
+				"n",
+				"prompt",
+				"size",
+			]);
+			expect(form.get("model")).toBe("selected-image");
+			expect(form.get("prompt")).toContain("combine all references");
+			expect(form.get("n")).toBe("1");
+			expect(form.get("size")).toBe("1024x1536");
+			expect(await formFiles(form, "image[]")).toEqual([
+				{ type: "image/gif", base64: GIF_FIXTURE_B64 },
+				{ type: "image/png", base64: PNG_FIXTURE_B64 },
+				{ type: "image/gif", base64: GIF_FIXTURE_B64 },
+				{ type: "image/png", base64: PNG_FIXTURE_B64 },
+			]);
+			expect(jsonBody(generation)).toEqual({
+				model: "selected-image",
+				prompt: expect.stringContaining("generate without references"),
+				n: 1,
+				response_format: "b64_json",
+			});
+			expect(generation?.headers.get("content-type")).toBe("application/json");
+			for (const request of transport.requests) {
+				expect(request.method).toBe("POST");
+				expect(request.headers.get("authorization")).toBe(`Bearer ${bearer}`);
+				expect(request.headers.get("x-lb-route")).toBe("image-pool");
+				expect(request.headers.get("x-request-tag")).toBe("multipart-regression");
+			}
+			expect(configuredHeaders).toEqual(originalHeaders);
+		} finally {
+			await removeWithRetries(inputPath);
+		}
+	});
+
+	it("keeps a single xai edit reference in the JSON image field", async () => {
+		const model = catalogModel("xai", "grok-imagine-image", "openai-images");
+		const bearer = "synthetic-xai-image-token";
+		const transport = recordRequests();
+		const ctx = createContext({
+			models: [model],
+			settings: Settings.isolated({ modelRoles: { image: "xai/grok-imagine-image" } }),
+			fetch: transport.fetch,
+			credentials: { xai: bearer },
+			configuredHeaders: { "Content-Type": "application/json", "X-Image-Route": "xai-direct" },
+		});
 		const result = await imageGenTool.execute(
-			"openai-images",
+			"xai-edit",
+			{ subject: "single reference", input: [{ data: PNG_FIXTURE_B64, mime_type: "image/png" }] },
+			undefined,
+			ctx,
+		);
+		collectPaths(result);
+
+		expect(transport.requests.map(request => request.url)).toEqual(["https://xai.example/v1/images/edits"]);
+		const request = transport.requests[0];
+		expect(request?.method).toBe("POST");
+		expect(request?.headers.get("content-type")).toBe("application/json");
+		expect(request?.headers.get("authorization")).toBe(`Bearer ${bearer}`);
+		expect(request?.headers.get("x-image-route")).toBe("xai-direct");
+		const body = jsonBody(request);
+		expect(body).toEqual({
+			model: "grok-imagine-image",
+			prompt: expect.stringContaining("single reference"),
+			aspect_ratio: "1:1",
+			resolution: "1k",
+			n: 1,
+			response_format: "b64_json",
+			image: { type: "image_url", url: `data:image/png;base64,${PNG_FIXTURE_B64}` },
+		});
+		expect(body).not.toHaveProperty("input_references");
+	});
+
+	it("keeps xai-oauth edit references ordered in the JSON images array", async () => {
+		const model = catalogModel("xai-oauth", "grok-imagine-image", "openai-images");
+		const bearer = "synthetic-xai-oauth-image-token";
+		const transport = recordRequests();
+		const ctx = createContext({
+			models: [model],
+			settings: Settings.isolated({ modelRoles: { image: "xai-oauth/grok-imagine-image" } }),
+			fetch: transport.fetch,
+			credentials: { "xai-oauth": bearer },
+			configuredHeaders: { "Content-Type": "application/json", "X-Image-Route": "xai-oauth" },
+		});
+		const result = await imageGenTool.execute(
+			"xai-oauth-edit",
 			{
-				subject: "edit reference",
-				input: [{ data: PNG_DATA, mime_type: "image/png" }],
+				subject: "multiple references",
+				aspect_ratio: "16:9",
+				image_size: "1536x1024",
+				input: [
+					{ data: `data:image/gif;base64,${GIF_FIXTURE_B64}` },
+					{ data: PNG_FIXTURE_B64, mime_type: "image/png" },
+					{ data: GIF_FIXTURE_B64, mime_type: "image/gif" },
+				],
 			},
 			undefined,
 			ctx,
 		);
 		collectPaths(result);
 
-		expect(urls).toEqual([
-			"https://deepinfra.example/v1/images/edits",
-			"https://deepinfra.example/v1/images/generations",
-		]);
-		expect(bodies[0]).toMatchObject({ model: "flux-selected", input_references: [{ type: "image_url" }] });
-		expect(bodies[1]).toMatchObject({ model: "flux-selected", input_references: [{ type: "image_url" }] });
+		expect(transport.requests.map(request => request.url)).toEqual(["https://xai-oauth.example/v1/images/edits"]);
+		const request = transport.requests[0];
+		expect(request?.method).toBe("POST");
+		expect(request?.headers.get("content-type")).toBe("application/json");
+		expect(request?.headers.get("authorization")).toBe(`Bearer ${bearer}`);
+		expect(request?.headers.get("x-image-route")).toBe("xai-oauth");
+		const body = jsonBody(request);
+		expect(body).toEqual({
+			model: "grok-imagine-image",
+			prompt: expect.stringContaining("multiple references"),
+			aspect_ratio: "16:9",
+			resolution: "2k",
+			n: 1,
+			response_format: "b64_json",
+			images: [
+				{ type: "image_url", url: `data:image/gif;base64,${GIF_FIXTURE_B64}` },
+				{ type: "image_url", url: `data:image/png;base64,${PNG_FIXTURE_B64}` },
+				{ type: "image_url", url: `data:image/gif;base64,${GIF_FIXTURE_B64}` },
+			],
+		});
+		expect(body).not.toHaveProperty("input_references");
 	});
 
 	it("uses OpenRouter native images with edit references and response media types", async () => {

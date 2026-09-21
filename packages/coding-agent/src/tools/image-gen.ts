@@ -387,7 +387,7 @@ async function loadImageFromUrl(
 
 /**
  * Shared POST for OpenAI-style image endpoints: bearer auth,
- * JSON body, and error mapping for both `{error: {message}}` and `{detail}`
+ * JSON or multipart body, and error mapping for both `{error: {message}}` and `{detail}`
  * error envelopes. Returns the raw response text.
  */
 async function postImageEndpointRequest(options: {
@@ -403,15 +403,20 @@ async function postImageEndpointRequest(options: {
 		options.apiKey,
 		async key => {
 			const configuredHeaders = await options.resolveHeaders?.();
+			const headers = new Headers(configuredHeaders);
+			headers.set("Authorization", `Bearer ${key}`);
+			headers.set("User-Agent", USER_AGENT);
+			const form = options.body instanceof FormData ? options.body : undefined;
+			if (form) {
+				// Fetch must supply the boundary, including when headers configure a JSON content type.
+				headers.delete("Content-Type");
+			} else {
+				headers.set("Content-Type", "application/json");
+			}
 			const resp = await options.fetchImpl(options.url, {
 				method: "POST",
-				headers: {
-					...configuredHeaders,
-					Authorization: `Bearer ${key}`,
-					"Content-Type": "application/json",
-					"User-Agent": USER_AGENT,
-				},
-				body: JSON.stringify(options.body),
+				headers,
+				body: form ?? JSON.stringify(options.body),
 				signal: options.signal,
 			});
 			const rawText = await resp.text();
@@ -1018,76 +1023,65 @@ async function generateOpenAIImages(
 ): Promise<AgentToolResult<ImageGenToolDetails, ImageGenParams>> {
 	const promptText = assemblePrompt(params);
 	const baseUrl = imageBaseUrl(model);
-	const size = resolveOpenAIImageSize(params.aspect_ratio, params.image_size);
 	const isXAI = model.provider === "xai" || model.provider === "xai-oauth";
-	const generationBody = isXAI
-		? {
-				model: model.id,
-				prompt: promptText,
-				aspect_ratio: params.aspect_ratio ?? "1:1",
-				resolution: resolveXAIResolution(params.image_size),
-				n: 1,
-				response_format: "b64_json",
-			}
-		: {
-				model: model.id,
-				prompt: promptText,
-				n: 1,
-				response_format: "b64_json",
-				...(size ? { size } : {}),
-			};
-	const references = inputImages.map(image => ({
-		type: "image_url",
-		url: toDataUrl(image),
-	}));
-	if (isXAI && references.length > XAI_MAX_EDIT_IMAGES) {
-		throw new Error(
-			`${model.provider} image edits accept up to ${XAI_MAX_EDIT_IMAGES} reference images; got ${references.length}.`,
-		);
-	}
-	const [firstReference, ...remainingReferences] = references;
-	const editBody = isXAI
-		? remainingReferences.length === 0
-			? { ...generationBody, image: firstReference }
-			: { ...generationBody, images: references }
-		: { ...generationBody, input_references: references };
-	const resolveHeaders = () => modelRegistry.resolveModelHeaders(model, signal);
-
-	let rawText: string;
-	if (inputImages.length === 0) {
-		rawText = await postImageEndpointRequest({
-			label: `${model.provider}/${model.id}`,
-			url: `${baseUrl}/images/generations`,
-			body: generationBody,
-			apiKey,
-			resolveHeaders,
-			fetchImpl,
-			signal,
-		});
+	const isEdit = inputImages.length > 0;
+	const size = isXAI ? undefined : resolveOpenAIImageSize(params.aspect_ratio, params.image_size);
+	let body: FormData | Record<string, unknown>;
+	if (isEdit && !isXAI) {
+		const form = new FormData();
+		form.append("model", model.id);
+		form.append("prompt", promptText);
+		form.append("n", "1");
+		if (size) form.append("size", size);
+		for (const [index, image] of inputImages.entries()) {
+			form.append(
+				"image[]",
+				new File([Buffer.from(image.data, "base64")], `image-${index + 1}.${getExtensionForMime(image.mimeType)}`, {
+					type: image.mimeType,
+				}),
+			);
+		}
+		body = form;
 	} else {
-		try {
-			rawText = await postImageEndpointRequest({
-				label: `${model.provider}/${model.id}`,
-				url: `${baseUrl}/images/edits`,
-				body: editBody,
-				apiKey,
-				resolveHeaders,
-				fetchImpl,
-				signal,
-			});
-		} catch (error) {
-			if (!(error instanceof ProviderHttpError) || error.status !== 404) throw error;
-			rawText = await postImageEndpointRequest({
-				label: `${model.provider}/${model.id}`,
-				url: `${baseUrl}/images/generations`,
-				body: editBody,
-				apiKey,
-				resolveHeaders,
-				fetchImpl,
-				signal,
-			});
+		body = isXAI
+			? {
+					model: model.id,
+					prompt: promptText,
+					aspect_ratio: params.aspect_ratio ?? "1:1",
+					resolution: resolveXAIResolution(params.image_size),
+					n: 1,
+					response_format: "b64_json",
+				}
+			: {
+					model: model.id,
+					prompt: promptText,
+					n: 1,
+					response_format: "b64_json",
+					...(size ? { size } : {}),
+				};
+		if (isEdit) {
+			if (inputImages.length > XAI_MAX_EDIT_IMAGES) {
+				throw new Error(
+					`${model.provider} image edits accept up to ${XAI_MAX_EDIT_IMAGES} reference images; got ${inputImages.length}.`,
+				);
+			}
+			const references = inputImages.map(image => ({
+				type: "image_url",
+				url: toDataUrl(image),
+			}));
+			if (references.length === 1) body.image = references[0];
+			else body.images = references;
 		}
 	}
+	const rawText = await postImageEndpointRequest({
+		label: `${model.provider}/${model.id}`,
+		url: `${baseUrl}/images/${isEdit ? "edits" : "generations"}`,
+		body,
+		apiKey,
+		resolveHeaders: () => modelRegistry.resolveModelHeaders(model, signal),
+		fetchImpl,
+		signal,
+	});
 	const images = await collectImageEndpointImages(rawText, fetchImpl, signal);
 	return buildImageEndpointResult(model.provider, model.id, images);
 }
