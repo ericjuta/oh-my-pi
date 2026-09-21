@@ -372,6 +372,144 @@ describe("ModelRegistry", () => {
 		});
 	});
 
+	describe("config-declared image runners", () => {
+		const chatBaseUrl = "http://127.0.0.1:1455/v1";
+		const imageBaseUrl = "http://127.0.0.1:2455/v1";
+		const imageIds = ["codexlb-canvas-v1", "gpt-image-2"];
+
+		function writeCodexLbYaml(endpoint: string = imageBaseUrl): string {
+			const modelsYamlPath = path.join(tempDir, "models.yml");
+			// The canvas id has no bundled reference, so catalog inheritance cannot hide a lost kind.
+			fs.writeFileSync(
+				modelsYamlPath,
+				`providers:
+  codex-lb:
+    apiKey: synthetic-codex-lb-key
+    # Cached discovery omits headers; derive bearer auth again on reload.
+    authHeader: true
+    api: openai-responses
+    baseUrl: ${chatBaseUrl}
+    discovery:
+      type: openai-models-list
+    models:
+      - id: codexlb-chat-v1
+      - id: gpt-image-2
+        kind: image
+        api: openai-images
+        baseUrl: ${endpoint}
+      - id: codexlb-canvas-v1
+        kind: image
+        api: openai-images
+        baseUrl: ${endpoint}
+`,
+			);
+			return modelsYamlPath;
+		}
+
+		test("YAML image routes retain provider credentials and stay out of chat pools across reload", async () => {
+			authStorage.setRuntimeApiKey("openai", "openai-key-must-not-be-used");
+			const isolated = Settings.isolated({});
+			const registry = new ModelRegistry(authStorage, writeCodexLbYaml(), { settings: isolated });
+
+			async function expectImageRoutes(endpoint: string) {
+				expect(registry.getError()).toBeUndefined();
+				const available = registry.getAvailable("all").filter(model => model.provider === "codex-lb");
+				expect(available.map(model => model.id).sort()).toEqual([
+					"codexlb-canvas-v1",
+					"codexlb-chat-v1",
+					"gpt-image-2",
+				]);
+				const imagePool = roleCandidatePool("image", isolated, registry).filter(
+					model => model.provider === "codex-lb",
+				);
+				expect(imagePool.map(model => model.id).sort()).toEqual(imageIds);
+				for (const model of imagePool) {
+					expect(model).toMatchObject({ kind: "image", api: "openai-images", baseUrl: endpoint });
+					await expect(registry.getApiKey(model)).resolves.toBe("synthetic-codex-lb-key");
+				}
+				expect(registry.getAvailable().filter(model => model.provider === "codex-lb")).toEqual([
+					expect.objectContaining({
+						id: "codexlb-chat-v1",
+						api: "openai-responses",
+						baseUrl: chatBaseUrl,
+					}),
+				]);
+				expect(
+					roleCandidatePool("default", isolated, registry)
+						.filter(model => model.provider === "codex-lb")
+						.map(model => model.id),
+				).toEqual(["codexlb-chat-v1"]);
+				const chat = registry.find("codex-lb", "codexlb-chat-v1");
+				if (!chat) throw new Error("Expected the configured chat sibling");
+				expect(modelKind(chat)).toBe("chat");
+			}
+
+			await expectImageRoutes(imageBaseUrl);
+			writeCodexLbYaml("http://127.0.0.1:2456/v1");
+			await registry.refresh("offline");
+			await expectImageRoutes("http://127.0.0.1:2456/v1");
+		});
+
+		test("chat-shaped discovery cannot replace configured image routing, including after cache reload", async () => {
+			const modelsYamlPath = writeCodexLbYaml();
+			const isolated = Settings.isolated({});
+			const registry = new ModelRegistry(authStorage, modelsYamlPath, {
+				settings: isolated,
+				fetch: mockOpenAiCompatibleModels(`${chatBaseUrl}/models`, [...imageIds, "codexlb-discovered-chat"]),
+			});
+			expect(registry.getAvailable("all")).toContainEqual(
+				expect.objectContaining({ provider: "codex-lb", id: "codexlb-canvas-v1", kind: "image" }),
+			);
+
+			await registry.refreshProvider("codex-lb", "online");
+
+			for (const current of [registry, new ModelRegistry(authStorage, modelsYamlPath, { settings: isolated })]) {
+				// A discovered-only sibling proves the collision was merged, rather than skipped.
+				expect(current.getAvailable()).toContainEqual(
+					expect.objectContaining({
+						provider: "codex-lb",
+						id: "codexlb-discovered-chat",
+						api: "openai-responses",
+						baseUrl: chatBaseUrl,
+					}),
+				);
+				const images = roleCandidatePool("image", isolated, current).filter(model => model.provider === "codex-lb");
+				expect(images.map(model => model.id).sort()).toEqual(imageIds);
+				for (const image of images) {
+					expect(image).toMatchObject({ kind: "image", api: "openai-images", baseUrl: imageBaseUrl });
+					await expect(current.getApiKey(image)).resolves.toBe("synthetic-codex-lb-key");
+				}
+			}
+		});
+
+		test("removing a kind override restores a catalog image model to the image role", async () => {
+			authStorage.setRuntimeApiKey("deepinfra", "synthetic-deepinfra-key");
+			const modelsYamlPath = path.join(tempDir, "models.yml");
+			fs.writeFileSync(
+				modelsYamlPath,
+				`providers:
+  deepinfra:
+    modelOverrides:
+      black-forest-labs/FLUX-2-pro:
+        kind: chat
+`,
+			);
+			const isolated = Settings.isolated({});
+			const registry = new ModelRegistry(authStorage, modelsYamlPath, { settings: isolated });
+			const flux = expect.objectContaining({ provider: "deepinfra", id: "black-forest-labs/FLUX-2-pro" });
+			expect(registry.getAvailable()).toContainEqual(flux);
+			expect(roleCandidatePool("default", isolated, registry)).toContainEqual(flux);
+			expect(roleCandidatePool("image", isolated, registry)).not.toContainEqual(flux);
+
+			fs.writeFileSync(modelsYamlPath, "providers: {}\n");
+			await registry.refresh("offline");
+
+			expect(roleCandidatePool("image", isolated, registry)).toContainEqual(flux);
+			expect(roleCandidatePool("default", isolated, registry)).not.toContainEqual(flux);
+			expect(registry.getAvailable()).not.toContainEqual(flux);
+		});
+	});
+
 	describe("OpenRouter routed suffix fallback", () => {
 		let registry: ModelRegistry;
 		beforeAll(() => {

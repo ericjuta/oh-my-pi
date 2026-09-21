@@ -82,6 +82,7 @@ export function buildCustomModelOverlay(
 		api,
 		baseUrl: modelDef.baseUrl ?? providerBaseUrl,
 		name: modelDef.name,
+		kind: modelDef.kind,
 		reasoning: modelDef.reasoning,
 		thinking: modelDef.thinking,
 		input: modelDef.input,
@@ -124,6 +125,7 @@ export function finalizeCustomModel(model: CustomModelOverlay, options: CustomMo
 	const built = buildModel({
 		id: resolvedModel.id,
 		name: resolvedModel.name ?? (options.useDefaults ? resolvedModel.id : undefined),
+		kind: resolvedModel.kind ?? reference?.kind,
 		api: resolvedModel.api,
 		provider: resolvedModel.provider,
 		baseUrl: resolvedModel.baseUrl,
@@ -147,6 +149,7 @@ export function finalizeCustomModel(model: CustomModelOverlay, options: CustomMo
 		premiumMultiplier: resolvedModel.premiumMultiplier,
 		isOAuth: resolvedModel.isOAuth,
 	} as ModelSpec<Api>);
+	if (resolvedModel.kind !== undefined) built.kind = resolvedModel.kind;
 	if (resolvedModel.cost) {
 		// Explicit custom prices outrank catalog corrections and schedules, just
 		// as they do for same-id model patches.

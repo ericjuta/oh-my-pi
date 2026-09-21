@@ -233,6 +233,7 @@ export function mergeProviderRemoteCompactionConfig(
  */
 export interface ModelPatch {
 	name?: string;
+	kind?: ModelKind;
 	reasoning?: boolean;
 	thinking?: ThinkingConfig;
 	input?: ("text" | "image")[];
@@ -316,7 +317,10 @@ export function applyModelPatch(base: Model<Api>, patch: ModelPatch, transport: 
 	// compat must not replace it with the catalog's baseline limits.
 	built.contextWindow = result.contextWindow;
 	built.maxTokens = result.maxTokens;
-	// Explicit input and cost patches outrank catalog corrections.
+	// Explicit kind/input patches outrank catalog corrections; later patches
+	// also retain the kind already selected for the base model.
+	const kind = patch.kind ?? base.kind;
+	if (kind !== undefined) built.kind = kind;
 	if (patch.input !== undefined) built.input = patch.input;
 	// Patches never change model identity. Preserve already-resolved pricing,
 	// including earlier custom prices and the deliberate absence of a schedule.

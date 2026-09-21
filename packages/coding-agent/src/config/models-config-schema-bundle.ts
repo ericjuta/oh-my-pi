@@ -1,4 +1,5 @@
 import { type } from "@oh-my-pi/omptype";
+import { MODEL_KINDS } from "@oh-my-pi/pi-catalog/types";
 import { once } from "@oh-my-pi/pi-utils";
 
 export const getModelsConfigSchemaBundle = once(() => {
@@ -90,6 +91,9 @@ export const getModelsConfigSchemaBundle = once(() => {
 		'"openai-completions" | "openai-responses" | "openai-codex-responses" | "azure-openai-responses" | "anthropic-messages" | "bedrock-converse-stream" | "google-generative-ai" | "google-gemini-cli" | "google-vertex"',
 	);
 
+	const ModelApiSchema = ApiSchema.or('"openai-images"');
+	const ModelKindSchema = type.enumerated(...MODEL_KINDS);
+
 	const EffortSchema = type('"minimal" | "low" | "medium" | "high" | "xhigh" | "max"');
 
 	const ThinkingControlModeSchema = type(
@@ -175,7 +179,8 @@ export const getModelsConfigSchemaBundle = once(() => {
 	const ModelDefinitionSchema = type({
 		id: "string",
 		"name?": "string",
-		"api?": ApiSchema,
+		"kind?": ModelKindSchema,
+		"api?": ModelApiSchema,
 		"baseUrl?": "string",
 		"reasoning?": "boolean",
 		"thinking?": ModelThinkingSchema,
@@ -229,6 +234,7 @@ export const getModelsConfigSchemaBundle = once(() => {
 
 	const ModelOverrideSchema = type({
 		"name?": "string",
+		"kind?": ModelKindSchema,
 		"reasoning?": "boolean",
 		"thinking?": ModelThinkingSchema,
 		"input?": '("text" | "image")[]',
@@ -301,7 +307,7 @@ export const getModelsConfigSchemaBundle = once(() => {
 	const ProviderConfigSchema = type({
 		"baseUrl?": "string",
 		"apiKey?": "string",
-		"api?": ApiSchema,
+		"api?": ModelApiSchema,
 		"headers?": { "[string]": "string" },
 		"compat?": ApiCompatSchema,
 		"remoteCompaction?": RemoteCompactionSchema,

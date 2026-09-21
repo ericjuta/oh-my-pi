@@ -101,6 +101,17 @@ providers:
 - `google-generative-ai`
 - `google-gemini-cli`
 - `google-vertex`
+- `openai-images`
+
+`openai-images` supports OpenAI-compatible image generation and editing for models with `kind: image`. It is accepted at provider level and per model. This does not extend hosted Responses provider support.
+
+### Allowed model `kind` values
+
+`kind` marks what a model is for, on a `models` entry or a `modelOverrides` entry:
+
+- `chat`, `tiny`, `image`, `tts`, `stt`, `search`, `judge`
+
+Ordinary models without `kind` remain chat models. A custom model that matches a bundled reference inherits its `kind` unless explicitly overridden. Models with `kind: image` are eligible for the `image` role, not chat roles.
 
 ### Allowed auth/discovery values
 
@@ -207,7 +218,7 @@ Provider defaults vs per-model overrides:
 
 - Provider `headers`, `compat`, and `remoteCompaction` are baselines.
 - Model `headers` override provider header keys.
-- `modelOverrides` can override model metadata (`name`, `reasoning`, `thinking`, `input`, `imageInputDecoder`,
+- `modelOverrides` can override model metadata (`name`, `kind`, `reasoning`, `thinking`, `input`, `imageInputDecoder`,
   `tokenizer`, `supportsTools`, `cost`, `premiumMultiplier`, `contextWindow`, `maxTokens`,
   `omitMaxOutputTokens`, `headers`, `compat`, `contextPromotionTarget`, `compactionModel`, and
   `remoteCompaction`).
@@ -439,7 +450,9 @@ When a bare id matches models from multiple providers, preference order is:
 
 Supported model roles:
 
-- `default`, `smol`, `slow`, `vision`, `plan`, `commit`, `tiny`, `task`, `advisor`
+- `default`, `smol`, `slow`, `vision`, `plan`, `commit`, `tiny`, `task`, `advisor`, `image`
+
+The `image` role accepts models with `kind: image`. Assign `modelRoles.image` in `config.yml`, or pick the image role in `/models`.
 
 The `tiny` role overrides the online model used for lightweight background tasks (session titles, memory, `auto`-thinking difficulty classification, unexpected-stop detection); when unset, these fall back to `@smol`. Pick one in `/models`.
 
@@ -762,6 +775,32 @@ providers:
         name: Claude Sonnet 4 (Proxy)
         reasoning: true
         input: [text, image]
+```
+
+### Custom image model on a chat provider
+
+This custom entry keeps chat on the provider's Codex Responses route and overrides only the image model's `api` and `baseUrl`. If `codex-lb` is already configured, retain its provider `api`, `baseUrl`, and chat model entries, and add the image entry to `models`.
+
+Set `CODEX_LB_API_KEY` in the environment before starting OMP. Both routes use the provider credential; `apiKey` below names the variable, not its value.
+
+```yaml
+providers:
+  codex-lb:
+    baseUrl: http://127.0.0.1:2455/backend-api/codex
+    apiKey: CODEX_LB_API_KEY
+    api: openai-codex-responses
+    models:
+      - id: gpt-image-2
+        kind: image
+        api: openai-images
+        baseUrl: http://127.0.0.1:2455/v1
+```
+
+Assign the image role in `config.yml`, or choose it in `/models`:
+
+```yaml
+modelRoles:
+  image: codex-lb/gpt-image-2
 ```
 
 ### Override built-in provider route + model metadata
