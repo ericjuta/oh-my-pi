@@ -1,5 +1,5 @@
 <system-notice>
-User message contains **jevify** → bulk classification through the `eval` kernel's `judge()`. You decide once, up front; the judge processes the bulk; you read only what it flags. This overrides the tendency to split the data up and scan it yourself.
+User message contains **jevify** → bulk classification through the `eval` kernel's `judge_batch()`. You decide once, up front; the judge processes the bulk; you read only what it flags. This overrides the tendency to split the data up and scan it yourself.
 
 <critical>
 - NEVER read bulk items before the rubric is frozen. Rubric first, data second.
@@ -19,18 +19,18 @@ Any list of ≥ ~20 homogeneous items with a bucket/yes-no/score question: commi
    - **Escalation rule**: which verdicts and which uncertainty (e.g. top probability `< 0.7`, `bool` in `0.3..0.7`, error) you will read yourself.
    - **Cap**: max state size; truncate with a visible marker and count truncations.
 2. **Partition** — load every unit in the kernel (`git show`, `glob`, `read`, parsers). Apply the pre-filter. Store units in a dict keyed by a stable id.
-3. **Judge** — one `judge(state, questions)` per unit, all questions in that call, all handles fired in one cell. `state` carries the id, the frozen framing (commit subject, question context), and the content. Then `wait(handles, raise_errors=False)`; tabulate `{id: choice, top_p, extra facts}`; keep errors as their own row.
+3. **Judge** — one `judge_batch(states, QUESTIONS, intent=…)` over every unit (`{id: state}`), all questions in that call, fired in one cell; `await judge(state, questions)` only for a single state. Each state carries the id, the frozen framing (commit subject, question context), and the content; an empty-string state rejects the whole batch. Then `await b.drain(timeout)` until `done == total`; tabulate `b.results()` as `{id: choice, top_p, extra facts}`; keep `b.failed()` errors (e.g. oversize state) as their own row.
 4. **Escalate** — sort by the escalation rule; `read`/print only those units' diffs; confirm or overturn each with evidence. Exact-match uncertain verdicts against the code (implementation contract, callers) rather than re-judging.
 5. **Report** — counts per label, pre-filter removals, truncations, then flagged items grouped by kind with file path + one-line evidence each. Judge output is evidence, not truth: state which verdicts you confirmed by reading.
 </workflow>
 
 <judge>
-`judge(state, questions) → JudgmentHandle`; returns immediately; `.wait()` → `{id: answer}`.
-- `state`: `str` | JSON object | JSON array. Every question sees the same state.
+`await judge(state, questions)` → `{id: answer}` for one state. `judge_batch(states, questions, intent=…)` (JS: `await judgeBatch(states, questions, { intent })`) → `JudgmentBatch` at once, run by the host.
+- `state`: non-empty `str` | JSON object | JSON array. Every question sees the same state.
 - `{type: "choice", instructions, criteria: {label: rubric, …}}` → `{choice, probabilities, confidence}`.
 - `{type: "bool", instructions, criteria?: {true, false}}` → `{bool: P(yes)}`.
 - `{type: "score", instructions, criteria: [lowest, …, highest]}` → `{score, probabilities, confidence}`.
-- `wait(handles, raise_errors=False)` (JS: `wait(handles, { raiseErrors: false })`) keeps a failure in its slot.
+- `await b.drain(timeout)` → `[(key, item)]` settled since the last drain; `b.status()` → `{done, total, failed, …}`; `b.results()` → `{key: answers}`; `b.failed()` → `{key: error}` (item failures never raise); `b.close()` when done. JS methods are all `await`ed.
 Cheap + fast; prefer over `completion()`/`agent()` for every classification, ranking, or yes/no.
 </judge>
 
@@ -59,17 +59,20 @@ import subprocess
 def git(*args): return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
 files = [f for f in git("show", "--name-only", "--format=", SHA).split() if not prefilter(f)]
 diffs = {f: git("show", "--format=", SHA, "--", f) for f in files}
-handles = {f: judge({"file": f, "subject": SUBJECT, "diff": d[:CAP] + ("\n…[truncated]" if len(d) > CAP else "")}, QUESTIONS) for f, d in diffs.items()}
-results = wait(list(handles.values()), raise_errors=False)
-rows = [(f, r) for f, r in zip(handles, results)]
-flag = [f for f, r in rows if isinstance(r, Exception) or r["verdict"]["choice"] != "belongs" or r["verdict"]["probabilities"]["belongs"] < 0.7 or r["logic"]["bool"] >= 0.5]
+b = judge_batch({f: {"file": f, "subject": SUBJECT, "diff": d[:CAP] + ("\n…[truncated]" if len(d) > CAP else "")} for f, d in diffs.items()}, QUESTIONS, intent="Judging commit diffs")
+while b.status()["done"] < b.total: await b.drain(60)
+ok, failed = b.results(), b.failed()
+b.close()
+flag = [f for f, r in ok.items() if r["verdict"]["choice"] != "belongs" or r["verdict"]["probabilities"]["belongs"] < 0.7 or r["logic"]["bool"] >= 0.5] + list(failed)
 ```
 
 **JavaScript:**
 
 ```js
-const handles = Object.fromEntries(Object.entries(diffs).map(([f, d]) => [f, judge({ file: f, subject: SUBJECT, diff: d.slice(0, CAP) }, QUESTIONS)]));
-const results = await wait(Object.values(handles), { raiseErrors: false });
+const b = await judgeBatch(Object.fromEntries(Object.entries(diffs).map(([f, d]) => [f, { file: f, subject: SUBJECT, diff: d.slice(0, CAP) }])), QUESTIONS, { intent: "Judging commit diffs" });
+while ((await b.status()).done < b.total) await b.drain({ timeout: 60 });
+const [ok, failed] = [await b.results(), await b.failed()];
+await b.close();
 ```
 
 Then print only `diffs[f]` for `f in flag`, confirm each against the code, and report.

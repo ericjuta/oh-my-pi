@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the `jevify` notice teaching the removed `JudgmentHandle`/`wait()` judge API: it now drives bulk classification through `judge_batch()` (JS `judgeBatch()`) and `await judge()` for a single state
+
 ## [18.3.4] - 2026-09-27
 
 ### Breaking Changes
