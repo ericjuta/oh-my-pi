@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added optional `JudgmentProvenance` fields separating selected/primary routes, raw response identity, fallback, and application answer-cache counts; unavailable evidence remains unknown.
+
+### Fixed
+
+- Kept raw judgment response identity separate from configured model aliases, omitted blank identities, and retained only the successfully parsed text completion's identity without changing billing.
+
 ## [18.8.7] - 2026-10-09
 
 ### Added

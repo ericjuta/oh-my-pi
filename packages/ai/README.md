@@ -9,6 +9,7 @@ Unified LLM API with automatic model discovery, provider configuration, token an
 - [Supported Providers](#supported-providers)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Judgment Provenance](#judgment-provenance)
 - [Tools](#tools)
    - [Defining Tools](#defining-tools)
    - [Handling Tool Calls](#handling-tool-calls)
@@ -43,6 +44,26 @@ Unified LLM API with automatic model discovery, provider configuration, token an
    - [Using OAuth Tokens](#using-oauth-tokens)
    - [Provider Notes](#provider-notes)
 - [License](#license)
+
+## Judgment Provenance
+
+`JudgmentResult` extends the exported `JudgmentProvenance` interface. Its seven optional fields distinguish routing from raw response identity and application answer caching:
+
+| Field | Meaning |
+| --- | --- |
+| `selectedModel` | Successful catalog route in `provider/id[@upstream]` form. |
+| `primaryModel` | First resolved eligible route before cooldowns or failures, in `provider/id[@upstream]` form. |
+| `fallback` | Whether `selectedModel` differs from `primaryModel`, not whether a returned model name differs from an alias. |
+| `responseModel` | Explicit raw response model identity, without a synthesized provider prefix; absent when unknown or when contributing answer identities disagree. |
+| `cache` | `hit`, `partial`, or `miss` in the application judgment-answer cache, not provider token-cache usage. |
+| `questions` | Total questions in the request. |
+| `cachedQuestions` | Questions answered from that application cache. |
+
+Missing fields mean unknown, not `false`, zero, or a cache miss. `model` remains a compatibility/display label and cannot establish fallback or cache use. These fields do not change token/cost accounting or represent physical provider-attempt counts.
+
+`TypeSafeJudge` exposes `responseModel` only from a nonblank string in the response payload's `model`; its compatibility `model` uses that value or the configured model when absent or invalid. `TextJudge` accepts an optional raw `TextCompletion.responseModel` and uses only the final successfully parsed completion's nonblank identity, never an earlier format-correction attempt's identity. `chatTextBackend` leaves it absent: `AssistantMessage.model` is configured identity, and `upstreamModel` may be inferred rather than a raw payload model. Custom text backends must likewise omit unknown raw identity.
+
+The coding agent's `ChainJudge` supplies route, fallback, cache, and question-count metadata; standalone library judges need not populate those fields. A fully cached result reports the current selected route but retains the original cached raw response identity. A partially cached result exposes `responseModel` only when all cached and fresh contributing answers have known, identical raw identities. Legacy cache rows without identity, missing fresh identity, or mixed identities leave it absent. Answer rewrites by older cache writers clear any prior raw identity, even when the answer value is unchanged. Non-cached chat/local judgments report `miss` with zero cached questions. These cache counts are distinct from `usage.cacheRead` and `usage.cacheWrite`.
 
 ## Supported Providers
 

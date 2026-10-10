@@ -1,3 +1,7 @@
+import { getCustomApi, registerCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { chatTextBackend } from "@oh-my-pi/pi-ai/judgment/chat";
+import { createMockModel, MOCK_API, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai/types";
 import { calculateUsageCost } from "@oh-my-pi/pi-catalog/models";
 import { describe, expect, it } from "bun:test";
 import {
@@ -139,25 +143,35 @@ describe("TextJudge", () => {
 		expect(answers.sev).toEqual({ type: "score", score: 1, probabilities: { "0": 0, "1": 1 }, confidence: 1 });
 	});
 
-	it("retries one malformed chat answer with the format-correction prompt", async () => {
+	it.each([
+		{ name: "different raw identity", finalIdentity: { responseModel: "raw-final" }, expected: "raw-final" },
+		{ name: "missing raw identity", finalIdentity: {}, expected: undefined },
+		{ name: "empty raw identity", finalIdentity: { responseModel: "" }, expected: undefined },
+		{ name: "whitespace raw identity", finalIdentity: { responseModel: " \t\n" }, expected: undefined },
+	])("retries one malformed chat answer using only the final $name", async ({ finalIdentity, expected }) => {
 		let calls = 0;
 		const judge = new TextJudge({
 			...backend("unused"),
 			parseRetries: 1,
 			async complete(textPrompt) {
 				calls++;
-				if (calls === 1) return { text: "<tool_call>read file</tool_call>" };
+				if (calls === 1) {
+					return { text: "<tool_call>read file</tool_call>", responseModel: "raw-earlier" };
+				}
 				expect(textPrompt.system).toContain("Classification retry");
 				expect(textPrompt.retry).toBe(true);
-				return { text: "yes" };
+				return { text: "yes", ...finalIdentity };
 			},
 		});
-		const { answers } = await judge.judge({
+		const result = await judge.judge({
 			state: "I will fix that now.",
 			questions: { stopped: { type: "noul", instructions: "Unexpected stop?" } },
 		});
 		expect(calls).toBe(2);
-		expect(answers.stopped.noul).toBe(1);
+		expect(result.answers.stopped.noul).toBe(1);
+		expect(result.model).toBe("mock-tiny");
+		expect(result.responseModel).toBe(expected);
+		expect(Object.hasOwn(result, "responseModel")).toBe(expected !== undefined);
 	});
 
 	it("takes a bare keyword for a single question", async () => {
@@ -182,16 +196,70 @@ describe("TextJudge", () => {
 	});
 });
 
+describe("chatTextBackend", () => {
+	it("does not report the configured AssistantMessage.model as a raw response identity", async () => {
+		const sourceId = "test/judgment-chat-identity";
+		const previous = getCustomApi(MOCK_API);
+		registerMockApi(sourceId);
+		try {
+			const model = createMockModel({
+				id: "configured-chat-alias",
+				responses: [
+					{
+						content: [" yes "],
+						usage: { input: 7, output: 1, cost: { input: 0.000014, total: 0.000014 } },
+					},
+				],
+			});
+			const attempts: AssistantMessage[] = [];
+			const judge = new TextJudge(
+				chatTextBackend(model, {
+					apiKey: "test-key",
+					onAttempt: message => {
+						attempts.push(message);
+					},
+				}),
+			);
+
+			const result = await judge.judge({
+				state: "Help! My payouts have been failing for 3 days.",
+				questions: { urgent: { type: "noul", instructions: "Does this convey urgency?" } },
+			});
+
+			expect(model.calls).toHaveLength(1);
+			expect(attempts).toHaveLength(1);
+			expect(attempts[0].model).toBe("configured-chat-alias");
+			expect(attempts[0].upstreamModel).toBeUndefined();
+			expect(result.answers.urgent.noul).toBe(1);
+			expect(result.model).toBe("configured-chat-alias");
+			expect(result.responseModel).toBeUndefined();
+			expect(Object.hasOwn(result, "responseModel")).toBe(false);
+			expect(result.usage).toEqual(attempts[0].usage);
+			expect(result.usage).toMatchObject({
+				input: 7,
+				output: 1,
+				totalTokens: 8,
+				cost: { input: 0.000014, total: 0.000014 },
+			});
+		} finally {
+			unregisterCustomApis(sourceId);
+			if (previous) {
+				registerCustomApi(MOCK_API, previous.streamSimple, previous.sourceId, previous.stream);
+			}
+		}
+	});
+});
+
 describe("TypeSafeJudge", () => {
 	const request = {
 		state: "Help! My payouts have been failing for 3 days.",
 		questions: { urgent: { type: "noul", instructions: "Does this convey urgency?" } },
 	} as const;
 
-	function answered(status = 200) {
+	function answered(status = 200, model = "jev-latest") {
 		return Response.json(
 			{
-				model: "jev-latest",
+				model,
 				answers: { urgent: { type: "noul", noul: 0.92 } },
 				usage: { input_tokens: 5, output_tokens: 1 },
 			},
@@ -199,33 +267,68 @@ describe("TypeSafeJudge", () => {
 		);
 	}
 
-	it("posts the request verbatim with a bearer key and maps the typed answer and usage", async () => {
-		const calls: { url: string; init: RequestInit | undefined }[] = [];
-		const judge = new TypeSafeJudge({
-			apiKey: "ts-key",
-			baseUrl: "https://ts.example/",
-			model: "jev-test",
-			fetch: async (url, init) => {
-				calls.push({ url: String(url), init });
-				return answered();
-			},
-		});
+	it.each(["jev-1.13-20260917", " jev-1.13-20260917 \t"])(
+		"posts the configured alias and preserves raw response model %j with the typed answer and usage",
+		async responseModel => {
+			const calls: { url: string; init: RequestInit | undefined }[] = [];
+			const judge = new TypeSafeJudge({
+				apiKey: "ts-key",
+				baseUrl: "https://ts.example/",
+				model: "jev-test",
+				fetch: async (url, init) => {
+					calls.push({ url: String(url), init });
+					return answered(200, responseModel);
+				},
+			});
 
-		const result = await judge.judge(request);
+			const result = await judge.judge(request);
 
-		expect(calls).toHaveLength(1);
-		expect(calls[0].url).toBe("https://ts.example/v1/systemone");
-		expect(new Headers(calls[0].init?.headers).get("authorization")).toBe("Bearer ts-key");
-		expect(JSON.parse(String(calls[0].init?.body))).toEqual({
-			state: request.state,
-			model: "jev-test",
-			questions: request.questions,
-		});
-		expect(result.answers.urgent.noul).toBe(0.92);
-		expect(result.model).toBe("jev-latest");
-		expect(result.usage.input).toBe(5);
-		expect(result.usage.totalTokens).toBe(6);
-	});
+			expect(calls).toHaveLength(1);
+			expect(calls[0].url).toBe("https://ts.example/v1/systemone");
+			expect(new Headers(calls[0].init?.headers).get("authorization")).toBe("Bearer ts-key");
+			expect(JSON.parse(String(calls[0].init?.body))).toEqual({
+				state: request.state,
+				model: "jev-test",
+				questions: request.questions,
+			});
+			expect(result.answers.urgent.noul).toBe(0.92);
+			expect(judge.model).toBe("jev-test");
+			expect(judge.label).toBe("typesafe/jev-test");
+			expect(result.model).toBe(responseModel);
+			expect(result.responseModel).toBe(responseModel);
+			expect(result.usage.input).toBe(5);
+			expect(result.usage.totalTokens).toBe(6);
+		},
+	);
+
+	it.each([
+		{ name: "missing", payload: {} },
+		{ name: "empty", payload: { model: "" } },
+		{ name: "whitespace", payload: { model: " \t\n" } },
+		{ name: "number", payload: { model: 42 } },
+	])(
+		"keeps the configured compatibility model without raw identity for a $name payload model",
+		async ({ payload }) => {
+			const judge = new TypeSafeJudge({
+				apiKey: "test-key",
+				model: "configured-alias",
+				fetch: async () =>
+					Response.json({
+						...payload,
+						answers: { urgent: { type: "noul", noul: 0.92 } },
+						usage: { input_tokens: 5, output_tokens: 1 },
+					}),
+			});
+
+			const result = await judge.judge(request);
+
+			expect(result.answers.urgent.noul).toBe(0.92);
+			expect(result.model).toBe("configured-alias");
+			expect(result.responseModel).toBeUndefined();
+			expect(Object.hasOwn(result, "responseModel")).toBe(false);
+			expect(result.usage).toMatchObject({ input: 5, output: 1, totalTokens: 6 });
+		},
+	);
 
 	it("keeps estimated judge cost finite when a successful response omits token counts", async () => {
 		const responses = [{}, { input_tokens: 5 }];
@@ -277,6 +380,7 @@ describe("TypeSafeJudge", () => {
 			api: "openrouter-decisions",
 			provider: "openrouter",
 			model: "typesafe/jev-1.13-20260917",
+			responseModel: "typesafe/jev-1.13-20260917",
 			usage: { input: 336, output: 48, cost: { input: 0.000014, total: 0.000014 } },
 		});
 	});

@@ -862,15 +862,25 @@ if "__omp_prelude_loaded__" not in globals():
         return result["answers"]
 
     class JudgmentItem:
-        """One settled ``judge_batch`` item: ``answers`` on success, else ``error``."""
+        """One settled ``judge_batch`` item; optional provenance is ``None`` when absent."""
 
-        __slots__ = ("key", "answers", "error", "model")
+        __slots__ = (
+            "key", "answers", "error", "model", "selected_model", "primary_model",
+            "response_model", "fallback", "cache", "questions", "cached_questions",
+        )
 
         def __init__(self, item):
             self.key = item.get("key")
             self.answers = item.get("answers")
             self.error = item.get("error")
             self.model = item.get("model")
+            self.selected_model = item.get("selectedModel")
+            self.primary_model = item.get("primaryModel")
+            self.response_model = item.get("responseModel")
+            self.fallback = item.get("fallback")
+            self.cache = item.get("cache")
+            self.questions = item.get("questions")
+            self.cached_questions = item.get("cachedQuestions")
 
         @property
         def ok(self):

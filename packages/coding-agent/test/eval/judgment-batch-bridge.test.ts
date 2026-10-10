@@ -24,6 +24,7 @@ import { EventBus } from "../../src/utils/event-bus";
 import type { PythonResult } from "../../src/eval/py/executor";
 import type { ToolSession } from "../../src/tools";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
+import { asGlobalFetch } from "../helpers/fetch-mock";
 
 const SMOL: Model<Api> = {
 	id: "smol",
@@ -255,8 +256,18 @@ describe("judge_batch bridge", () => {
 			key: 0,
 			answers: { tests: { type: "bool", bool: 1 } },
 			model: "p/smol",
+			selectedModel: "p/smol",
+			primaryModel: "p/smol",
+			responseModel: undefined,
+			fallback: false,
+			cache: "miss",
+			questions: 1,
+			cachedQuestions: 0,
 		});
-		expect(first.find(item => item.key === 1)?.error).toContain('judgment "tests"');
+		const failedItem = first.find(item => item.key === 1);
+		expect(failedItem?.error).toContain('judgment "tests"');
+		// Failed parsing must not reuse the preceding successful item's metadata.
+		expect(Object.keys(failedItem!).sort()).toEqual(["error", "key"]);
 		// Nothing new and the run is still going: a zero timeout returns immediately with nothing.
 		expect(await drain(session, created.id, 0)).toEqual([]);
 
@@ -267,6 +278,13 @@ describe("judge_batch bridge", () => {
 				key: 2,
 				answers: { tests: { type: "bool", bool: 0 } },
 				model: "p/smol",
+				selectedModel: "p/smol",
+				primaryModel: "p/smol",
+				responseModel: undefined,
+				fallback: false,
+				cache: "miss",
+				questions: 1,
+				cachedQuestions: 0,
 			},
 		]);
 		expect(await drain(session, created.id, 0)).toEqual([]);
@@ -336,7 +354,10 @@ describe("judge_batch bridge", () => {
 		expect(await runEvalJudgmentBatch({ op: "cancel", id: created.id }, { session })).toEqual({ cancelled: true });
 		gate.resolve("tests: yes");
 		const items = await drain(session, created.id, 5_000);
-		expect(items.map(item => item.error)).toEqual(["cancelled", "cancelled"]);
+		expect(items).toEqual([
+			{ key: 0, error: "cancelled" },
+			{ key: 1, error: "cancelled" },
+		]);
 		expect((await status(session, created.id)).running).toBe(false);
 		expect(await runEvalJudgmentBatch({ op: "cancel", id: created.id }, { session })).toEqual({ cancelled: false });
 		expect(manager?.getJob(created.id)?.status).toBe("cancelled");
@@ -371,6 +392,13 @@ describe("judge_batch bridge", () => {
 				key: 0,
 				answers: { tests: { type: "bool", bool: 1 } },
 				model: "p/smol",
+				selectedModel: "p/smol",
+				primaryModel: "p/smol",
+				responseModel: undefined,
+				fallback: false,
+				cache: "miss",
+				questions: 1,
+				cachedQuestions: 0,
 			},
 		]);
 		expect((await status(session, created.id)).running).toBe(false);
@@ -378,6 +406,148 @@ describe("judge_batch bridge", () => {
 });
 
 describe("judgeBatch() JS prelude", () => {
+	function hostSandbox(session: ToolSession): vm.Context {
+		const sandbox = vm.createContext({
+			questions: QUESTIONS,
+			__omp_call_tool__: async (name: string, args: Record<string, unknown>) => {
+				if (name !== "__judge_batch__") throw new Error(`unexpected bridge call ${name}`);
+				return runEvalJudgmentBatch(args, { session });
+			},
+		});
+		vm.runInContext(JAVASCRIPT_PRELUDE_SOURCE, sandbox);
+		return sandbox;
+	}
+
+	it("preserves native provider provenance after VM reattach without replaying the shared drain", async () => {
+		const { session } = makeSession({ jobs: false });
+		vi.spyOn(session.modelRegistry!, "getAvailable").mockReturnValue([{ ...SMOL, api: "typesafe" }]);
+		const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(
+			asGlobalFetch(async (_url, init) => {
+				const request = JSON.parse(String(init?.body));
+				expect(request.model).toBe("smol");
+				expect(request.questions).toEqual({
+					tests: { type: "noul", instructions: QUESTIONS.tests.instructions },
+				});
+				return Response.json({
+					model: "served-tests-revision",
+					answers: { tests: { type: "noul", noul: 0.83 } },
+					usage: { input_tokens: 10, output_tokens: 1 },
+				});
+			}),
+		);
+		const original = hostSandbox(session);
+		original.states = { a: ["js-native-provenance", crypto.randomUUID()] };
+		const id = await vm.runInContext(
+			`(async () => {
+				globalThis.batch = await judgeBatch(states, questions);
+				return batch.id;
+			})()`,
+			original,
+		);
+		const restored = hostSandbox(session);
+		restored.id = id;
+		const seen = await vm.runInContext(
+			`(async () => {
+				const batch = await judgeBatch.attach(id);
+				const items = await batch.drain({ timeout: 5 });
+				return {
+					id: batch.id,
+					items: items.map(([key, item]) => [key, { ...item, ok: item.ok }]),
+					results: await batch.results(),
+				};
+			})()`,
+			restored,
+		);
+		expect(seen).toStrictEqual({
+			id,
+			items: [
+				[
+					"a",
+					{
+						key: "a",
+						answers: { tests: { type: "bool", bool: 0.83 } },
+						error: undefined,
+						model: "p/served-tests-revision",
+						selectedModel: "p/smol",
+						primaryModel: "p/smol",
+						responseModel: "served-tests-revision",
+						fallback: false,
+						cache: "miss",
+						questions: 1,
+						cachedQuestions: 0,
+						ok: true,
+					},
+				],
+			],
+			results: { a: { tests: { type: "bool", bool: 0.83 } } },
+		});
+		expect(await vm.runInContext("batch.drain({ timeout: 0 })", original)).toEqual([]);
+		expect(await vm.runInContext("batch.results()", original)).toEqual(seen.results);
+		expect(fetch).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps unavailable response identity and failed-item provenance undefined through the real host", async () => {
+		vi.spyOn(ai, "completeSimple").mockImplementation(async (_model, context, options) => {
+			const user = context.messages.find(message => message.role === "user");
+			const prompt = typeof user?.content === "string" ? user.content : JSON.stringify(user?.content);
+			const message = reply("tests: yes");
+			if (prompt.includes("js-provider-failure")) {
+				message.stopReason = "error";
+				message.errorMessage = "js-provider-failure";
+			}
+			options?.onAttempt?.(message);
+			return message;
+		});
+		const { session } = makeSession({ jobs: false });
+		const sandbox = hostSandbox(session);
+		const seen = await vm.runInContext(
+			`(async () => {
+				const batch = await judgeBatch(
+					{ good: "js-no-response-identity", bad: "js-provider-failure" },
+					questions,
+					{ retries: 0, concurrency: 1 },
+				);
+				const items = {};
+				for await (const [key, item] of batch.drainIter({ timeout: 5 })) {
+					items[key] = { ...item, ok: item.ok };
+				}
+				return { items, results: await batch.results(), failed: await batch.failed() };
+			})()`,
+			sandbox,
+		);
+		expect(seen.items.good).toStrictEqual({
+			key: "good",
+			answers: { tests: { type: "bool", bool: 1 } },
+			error: undefined,
+			model: "p/smol",
+			selectedModel: "p/smol",
+			primaryModel: "p/smol",
+			responseModel: undefined,
+			fallback: false,
+			cache: "miss",
+			questions: 1,
+			cachedQuestions: 0,
+			ok: true,
+		});
+		expect(seen.items.bad.error).toContain("js-provider-failure");
+		expect(seen.items.bad).toStrictEqual({
+			key: "bad",
+			answers: undefined,
+			error: seen.items.bad.error,
+			model: undefined,
+			selectedModel: undefined,
+			primaryModel: undefined,
+			responseModel: undefined,
+			fallback: undefined,
+			cache: undefined,
+			questions: undefined,
+			cachedQuestions: undefined,
+			ok: false,
+		});
+		expect(seen.results).toEqual({ good: { tests: { type: "bool", bool: 1 } } });
+		expect(seen.failed).toEqual({ bad: seen.items.bad.error });
+	});
+
 	it("maps states to keyed items and drainIter stops on an empty drain", async () => {
 		const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
 		const drains = [
@@ -441,60 +611,70 @@ describe("judgeBatch() JS prelude", () => {
 	});
 });
 
-async function runPythonJudgeBatchInSubprocess(tempDir: TempDir): Promise<PythonResult> {
+interface PythonJudgeBatchResult extends PythonResult {
+	/** Native wire requests the host sent, as `[state, questionIds]`. */
+	requests: Array<[string, string[]]>;
+}
+
+async function runPythonJudgeBatchInSubprocess(tempDir: TempDir): Promise<PythonJudgeBatchResult> {
 	const repoRoot = path.resolve(import.meta.dir, "../../..");
 	const scriptPath = path.join(tempDir.path(), "run-python-judge-batch.ts");
 	const resultPath = path.join(tempDir.path(), "python-judge-batch-result.json");
-	const aiPath = path.resolve(import.meta.dir, "../../../ai/src/index.ts");
 	const executorPath = path.resolve(import.meta.dir, "../../src/eval/py/executor.ts");
 	const settingsPath = path.resolve(import.meta.dir, "../../src/config/settings.ts");
 	const registryPath = path.resolve(import.meta.dir, "../../src/config/model-registry.ts");
 	const setupPath = path.resolve(import.meta.dir, "../helpers/agent-session-setup.ts");
+	// stdout is presentation-capped per line; display(dict) preserves structured JSON evidence.
 	const cellOne = [
-		"import json",
 		'Q = {"tests": {"type": "bool", "instructions": "Does the request mention tests?"}}',
-		'b = judge_batch({"a": "add tests please", "b": "rename a local"}, Q, intent="Classifying: Test idiomacy")',
-		"first = await b.drain(timeout=30)",
-		"second = await b.drain(timeout=30)",
-		"items = sorted(first + second, key=lambda kv: kv[0])",
+		'b = judge_batch({"a": "add tests please", "b": "rename a local", "c": "provider failure"}, Q, retries=0, intent="Classifying: Test idiomacy")',
+		"items = sorted([entry async for entry in b.drain_iter(timeout=30)], key=lambda kv: kv[0])",
+		'fields = ("selected_model", "primary_model", "response_model", "fallback", "cache", "questions", "cached_questions")',
+		"def provenance(item): return {field: getattr(item, field) for field in fields}",
 		"single = await judge('write tests', Q)",
-		'print(json.dumps({"id": b.id, "total": b.total, "items": [[k, i.ok, i.answers or i.error] for k, i in items], "single": single}))',
+		'absent = JudgmentItem({"answers": {}})',
+		'display({"id": b.id, "total": b.total, "items": [[k, i.ok, i.answers or i.error, provenance(i)] for k, i in items], "single": single, "absent": provenance(absent)})',
 	].join("\n");
 	const cellTwo = [
-		"import json",
 		"again = judge_batch.attach(b.id)",
 		"rest = await again.drain(timeout=0)",
-		'print(json.dumps({"rest": rest, "status": again.status()["done"], "results": sorted(again.results())}))',
+		'attached = {"rest": rest, "status": again.status()["done"], "results": sorted(again.results()), "failed": sorted(again.failed())}',
 		"again.close()",
+		'Q2 = {**Q, "short": {"type": "bool", "instructions": "Is the request short?"}}',
+		'partial = judge_batch({"partial": "add tests please"}, Q2)',
+		'hits = judge_batch({"hit": "add tests please", "unknown": "rename a local"}, Q)',
+		"cached = [entry async for entry in partial.drain_iter(timeout=30)] + [entry async for entry in hits.drain_iter(timeout=30)]",
+		'display({**attached, "cached": [[k, i.answers, provenance(i)] for k, i in sorted(cached, key=lambda kv: kv[0])]})',
 	].join("\n");
 	await Bun.write(
 		scriptPath,
 		`
 import { vi } from "bun:test";
-import * as ai from ${JSON.stringify(aiPath)};
 import { executePython } from ${JSON.stringify(executorPath)};
 import { Settings } from ${JSON.stringify(settingsPath)};
 import { ModelRegistry } from ${JSON.stringify(registryPath)};
 import { createInMemoryAuthStorage } from ${JSON.stringify(setupPath)};
 
-const SMOL = ${JSON.stringify(SMOL)};
+const SMOL = { ...${JSON.stringify(SMOL)}, api: "typesafe" };
 const settings = Settings.isolated({ "async.enabled": false, "task.isolation.enabled": false, modelRoles: { judge: "p/smol" } });
 const authStorage = createInMemoryAuthStorage();
 authStorage.keys.setRuntime("p", "test-key");
 const modelRegistry = new ModelRegistry(authStorage, "/nonexistent/judgment-batch-py-models.yml");
 vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([SMOL]);
 const session = { cwd: ${JSON.stringify(tempDir.path())}, settings, modelRegistry, getSessionId: () => "sess-py", getAgentId: () => "Main" };
-vi.spyOn(ai, "completeSimple").mockImplementation(async (_model, context) => {
-	const user = context.messages.find(message => message.role === "user");
-	const prompt = typeof user?.content === "string" ? user.content : JSON.stringify(user?.content);
-	return {
-		role: "assistant",
-		api: "openai-responses",
-		provider: "p",
-		model: "smol",
-		stopReason: "stop",
-		content: [{ type: "text", text: prompt.includes("tests") ? "tests: yes" : "tests: no" }],
-	};
+const requests = [];
+vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+	if (String(input) !== "https://example.test/v1/v1/systemone") throw new Error("unexpected judgment endpoint");
+	const request = JSON.parse(String(init?.body));
+	if (request.model !== "smol") throw new Error("unexpected requested model");
+	requests.push([request.state, Object.keys(request.questions)]);
+	if (request.state === "provider failure") return new Response("fixture provider failure", { status: 400 });
+	const bool = request.state.includes("tests") ? 1 : 0;
+	return Response.json({
+		...(bool ? { model: "served-tests" } : {}),
+		answers: Object.fromEntries(Object.keys(request.questions).map(id => [id, { type: "noul", noul: bool }])),
+		usage: { input_tokens: 3, output_tokens: 1 },
+	});
 });
 const options = {
 	cwd: ${JSON.stringify(tempDir.path())},
@@ -504,39 +684,99 @@ const options = {
 };
 const one = await executePython(${JSON.stringify(cellOne)}, options);
 const two = await executePython(${JSON.stringify(cellTwo)}, options);
-await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({ exitCode: one.exitCode || two.exitCode, output: one.output + "\\n" + two.output }));
+await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({ exitCode: one.exitCode || two.exitCode, output: one.output + "\\n" + two.output, displayOutputs: [...one.displayOutputs, ...two.displayOutputs], requests }));
 process.exit(0);
 `,
 	);
-	const child = await $`bun ${scriptPath}`.cwd(repoRoot).quiet().nothrow();
+	// The script is not a test entrypoint, so the shared judgment cache is live; keep it in the temp dir.
+	const child = await $`bun ${scriptPath}`
+		.cwd(repoRoot)
+		.env({ ...process.env, OMP_JUDGMENT_CACHE_DB: path.join(tempDir.path(), "judgment-cache.db") })
+		.quiet()
+		.nothrow();
 	const stdout = child.stdout.toString();
 	const stderr = child.stderr.toString();
-	if (child.exitCode !== 0)
-		throw new Error(stderr || stdout || `Python judge_batch subprocess exited with ${child.exitCode}`);
-	return (await Bun.file(resultPath).json()) as PythonResult;
+	if (child.exitCode !== 0) {
+		throw new Error(
+			`Python judge_batch subprocess exited with ${child.exitCode}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+		);
+	}
+	const result = (await Bun.file(resultPath).json()) as PythonJudgeBatchResult;
+	if (result.exitCode !== 0) {
+		throw new Error(
+			`Python judge_batch cell exited with ${result.exitCode}\nPython output:\n${result.output}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+		);
+	}
+	return result;
 }
 
 describe("judge_batch() Python prelude", () => {
-	it("drains across cells and re-attaches by id", async () => {
+	it("preserves native and cached provenance, keeps missing values None, and leaves judge answers and the shared drain cursor unchanged", async () => {
 		const tempDir = TempDir.createSync("@omp-eval-judge-batch-py-");
 		try {
 			const result = await runPythonJudgeBatchInSubprocess(tempDir);
 			expect(result.exitCode).toBe(0);
-			const [one, two] = result.output
-				.trim()
-				.split("\n")
-				.filter(line => line.startsWith("{"))
-				.map(line => JSON.parse(line));
-			expect(one).toMatchObject({
-				total: 2,
+			const evidence = result.displayOutputs.flatMap(output => (output.type === "json" ? [output.data] : []));
+			expect(evidence).toHaveLength(2);
+			const [one, two] = evidence;
+			const absent = {
+				selected_model: null,
+				primary_model: null,
+				response_model: null,
+				fallback: null,
+				cache: null,
+				questions: null,
+				cached_questions: null,
+			};
+			const routed = {
+				selected_model: "p/smol",
+				primary_model: "p/smol",
+				response_model: "served-tests",
+				fallback: false,
+				cache: "miss",
+				questions: 1,
+				cached_questions: 0,
+			};
+			expect(one).toEqual({
+				id: expect.stringMatching(/^jdgb-/),
+				total: 3,
 				items: [
-					["a", true, { tests: { type: "bool", bool: 1 } }],
-					["b", true, { tests: { type: "bool", bool: 0 } }],
+					["a", true, { tests: { type: "bool", bool: 1 } }, routed],
+					["b", true, { tests: { type: "bool", bool: 0 } }, { ...routed, response_model: null }],
+					["c", false, expect.stringContaining("fixture provider failure"), absent],
 				],
 				single: { tests: { type: "bool", bool: 1 } },
+				absent,
 			});
-			expect(String(one.id)).toMatch(/^jdgb-/);
-			expect(two).toEqual({ rest: [], status: 2, results: ["a", "b"] });
+			expect(two).toEqual({
+				rest: [],
+				status: 3,
+				results: ["a", "b"],
+				failed: ["c"],
+				cached: [
+					["hit", { tests: { type: "bool", bool: 1 } }, { ...routed, cache: "hit", cached_questions: 1 }],
+					[
+						"partial",
+						{ tests: { type: "bool", bool: 1 }, short: { type: "bool", bool: 1 } },
+						{ ...routed, cache: "partial", questions: 2, cached_questions: 1 },
+					],
+					[
+						"unknown",
+						{ tests: { type: "bool", bool: 0 } },
+						{ ...routed, response_model: null, cache: "hit", cached_questions: 1 },
+					],
+				],
+			});
+			// Cached answers never reach the provider: only the partial item's uncached question is sent.
+			expect(
+				result.requests.toSorted((x, y) => x[0].localeCompare(y[0]) || x[1].join().localeCompare(y[1].join())),
+			).toEqual([
+				["add tests please", ["short"]],
+				["add tests please", ["tests"]],
+				["provider failure", ["tests"]],
+				["rename a local", ["tests"]],
+				["write tests", ["tests"]],
+			]);
 		} finally {
 			tempDir.removeSync();
 		}

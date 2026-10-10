@@ -84,7 +84,7 @@ const BACKOFF_BASE_MS = 500;
 const BACKOFF_MAX_MS = 5_000;
 
 interface SystemOneResponse {
-	model: string;
+	model?: unknown;
 	answers: Record<string, Answer>;
 	/** OpenRouter adds the billed `cost` in USD; some routes omit token counts. */
 	usage: { input_tokens?: number; output_tokens?: number; cost?: number };
@@ -137,10 +137,13 @@ export class TypeSafeJudge implements Judge {
 				);
 			}
 		}
+		const responseModel =
+			typeof response.model === "string" && response.model.trim().length > 0 ? response.model : undefined;
 		return {
 			api: this.api,
 			provider: this.provider,
-			model: response.model,
+			model: responseModel ?? this.model,
+			...(responseModel === undefined ? {} : { responseModel }),
 			answers: response.answers as JudgmentResult<Q>["answers"],
 			usage: tokenUsage(response.usage.input_tokens, response.usage.output_tokens, response.usage.cost),
 		};

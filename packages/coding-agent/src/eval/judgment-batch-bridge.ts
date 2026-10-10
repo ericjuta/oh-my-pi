@@ -16,7 +16,7 @@
  * batch survives kernel resets (`attach(id)`) until `close()` or its owner
  * session releases it.
  */
-import type { JudgmentState, Question } from "@oh-my-pi/pi-ai";
+import type { JudgmentProvenance, JudgmentState, Question } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import { formatCost } from "@oh-my-pi/pi-tui/overlays/agent-hub-renderer";
 import type { ChainJudge } from "../judgment";
@@ -51,7 +51,7 @@ const DEFAULT_INTENT = "Judging";
 export type BatchKey = string | number;
 
 /** One settled item as the cell receives it from `drain()`. */
-export interface JudgmentBatchItem {
+export interface JudgmentBatchItem extends JudgmentProvenance {
 	key: BatchKey;
 	answers?: Record<string, CellAnswer>;
 	error?: string;
@@ -391,7 +391,7 @@ export class JudgmentBatch {
 				const result = toEvalJudgmentResult(
 					await judge.judge({ state: input.state, questions: this.#questions }, { signal }),
 				);
-				return { key: input.key, answers: result.answers, model: result.model };
+				return { key: input.key, ...result };
 			} catch (error) {
 				lastError = error;
 			} finally {

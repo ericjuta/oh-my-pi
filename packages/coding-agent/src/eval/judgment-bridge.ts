@@ -14,6 +14,7 @@
 import type {
 	Answer,
 	ChoiceQuestion,
+	JudgmentProvenance,
 	JudgmentResult,
 	JudgmentState,
 	JsonValue,
@@ -40,8 +41,8 @@ export const EVAL_JUDGMENT_BRIDGE_NAME = "__judge__";
 /** Answer as the cell sees it: library `noul` answers surface as `bool`. */
 export type CellAnswer = Answer | { type: "bool"; bool: number };
 
-/** Typed answers plus the backend that produced them, returned to the cell. */
-export interface EvalJudgmentResult {
+/** Host result; batch items expose provenance while direct `judge()` returns only answers. */
+export interface EvalJudgmentResult extends JudgmentProvenance {
 	answers: Record<string, CellAnswer>;
 	model: string;
 }
@@ -156,14 +157,24 @@ export function parseQuestions(value: unknown): Record<string, Question> {
 	return questions;
 }
 
-/** Shape a library judgment result into the cell-facing answers and backend label. */
+/** Preserve supplied provenance while shaping answers and the compatibility backend label. */
 export function toEvalJudgmentResult(result: JudgmentResult<Questions>): EvalJudgmentResult {
 	const answers: Record<string, CellAnswer> = {};
 	for (const id in result.answers) {
 		const answer = result.answers[id];
 		answers[id] = answer.type === "noul" ? { type: "bool", bool: answer.noul } : answer;
 	}
-	return { answers, model: `${result.provider}/${result.model}` };
+	return {
+		answers,
+		model: `${result.provider}/${result.model}`,
+		selectedModel: result.selectedModel,
+		primaryModel: result.primaryModel,
+		responseModel: result.responseModel,
+		fallback: result.fallback,
+		cache: result.cache,
+		questions: result.questions,
+		cachedQuestions: result.cachedQuestions,
+	};
 }
 
 /**

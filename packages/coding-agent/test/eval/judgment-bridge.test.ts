@@ -4,7 +4,7 @@ import type { Api, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
-import { runEvalJudgment } from "../../src/eval/judgment-bridge";
+import { runEvalJudgment, toEvalJudgmentResult } from "../../src/eval/judgment-bridge";
 import { JAVASCRIPT_PRELUDE_SOURCE } from "../../src/eval/js/shared/prelude";
 import type { ToolSession } from "../../src/tools";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
@@ -33,6 +33,14 @@ const JEV_PREVIEW: Model<Api> = {
 	kind: "judge",
 } as Model<Api>;
 
+// Native chains may fall back only to another native judge, never to prompted chat.
+const NATIVE_FALLBACK: Model<Api> = {
+	...SMOL,
+	api: "typesafe",
+	kind: "judge",
+	baseUrl: "https://fallback.example.test/",
+} as Model<Api>;
+
 function makeSession(opts: { typesafe?: boolean } = {}): ToolSession {
 	const settings = Settings.isolated({
 		"async.enabled": false,
@@ -44,7 +52,7 @@ function makeSession(opts: { typesafe?: boolean } = {}): ToolSession {
 	authStorage.keys.setRuntime("p", "test-key");
 	if (opts.typesafe) authStorage.keys.setRuntime("typesafe", "ts-key");
 	const modelRegistry = new ModelRegistry(authStorage, "/nonexistent/judgment-bridge-models.yml");
-	vi.spyOn(modelRegistry, "getAvailable").mockReturnValue(opts.typesafe ? [JEV_PREVIEW, SMOL] : [SMOL]);
+	vi.spyOn(modelRegistry, "getAvailable").mockReturnValue(opts.typesafe ? [JEV_PREVIEW, NATIVE_FALLBACK] : [SMOL]);
 	return { settings, modelRegistry, getSessionId: () => "sess-1" } as unknown as ToolSession;
 }
 
@@ -123,13 +131,24 @@ describe("eval judge() bridge", () => {
 			tone: { type: "score", score: 2, probabilities: { "0": 0, "1": 0, "2": 1 }, confidence: 1 },
 		});
 		expect(result.model).toBe("p/smol");
+		expect(result).toMatchObject({
+			selectedModel: "p/smol",
+			primaryModel: "p/smol",
+			fallback: false,
+			cache: "miss",
+			questions: 3,
+			cachedQuestions: 0,
+		});
+		// A configured chat model name is not evidence of a raw provider response identity.
+		expect(result.responseModel).toBeUndefined();
 		const options = spy.mock.calls[0]?.[2] as { disableReasoning?: boolean; temperature?: number };
 		expect(options.disableReasoning).toBe(true);
 		expect(options.temperature).toBe(0);
 	});
 
-	it("routes to the selected TypeSafe judge and forwards questions verbatim", async () => {
+	it("routes to the selected TypeSafe judge without mistaking its response alias for fallback", async () => {
 		const chat = vi.spyOn(ai, "completeSimple");
+		const state = ["add tests", crypto.randomUUID()];
 		let body: { model: string; state: unknown; questions: unknown } | undefined;
 		vi.spyOn(globalThis, "fetch").mockImplementation(
 			asGlobalFetch(async (url, init) => {
@@ -137,21 +156,87 @@ describe("eval judge() bridge", () => {
 				body = JSON.parse(String(init?.body));
 				expect(body).toEqual(expect.objectContaining({ model: "jev-preview" }));
 				return Response.json({
-					model: "jev-preview",
+					model: "jev-serving-version",
 					answers: { tests: { type: "noul", noul: 0.83 } },
 					usage: { input_tokens: 10, output_tokens: 1 },
 				});
 			}),
 		);
 		const result = await runEvalJudgment(
-			{ state: ["add tests"], questions: { tests: QUESTIONS.tests } },
+			{ state, questions: { tests: QUESTIONS.tests } },
 			{ session: makeSession({ typesafe: true }) },
 		);
 
 		expect(result.answers).toEqual({ tests: { type: "bool", bool: 0.83 } });
-		expect(body?.state).toEqual(["add tests"]);
+		expect(result).toMatchObject({
+			selectedModel: "typesafe/jev-preview",
+			primaryModel: "typesafe/jev-preview",
+			responseModel: "jev-serving-version",
+			fallback: false,
+			cache: "miss",
+			questions: 1,
+			cachedQuestions: 0,
+		});
+		expect(body?.state).toEqual(state);
 		expect(body?.questions).toEqual({ tests: { type: "noul", instructions: QUESTIONS.tests.instructions } });
 		expect(chat).not.toHaveBeenCalled();
+	});
+
+	it("preserves successful fallback routing without borrowing the failed provider identity", async () => {
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			asGlobalFetch(async (url, init) => {
+				const body = JSON.parse(String(init?.body));
+				if (String(url) === "https://judge.example.test/v1/systemone") {
+					expect(body.model).toBe("jev-preview");
+					return Response.json({ model: "failed-serving-version", error: { message: "denied" } }, { status: 401 });
+				}
+				expect(String(url)).toBe("https://fallback.example.test/v1/systemone");
+				expect(body.model).toBe("smol");
+				return Response.json({
+					answers: { tests: { type: "noul", noul: 1 } },
+					usage: { input_tokens: 3, output_tokens: 1 },
+				});
+			}),
+		);
+		const chat = vi.spyOn(ai, "completeSimple");
+		const result = await runEvalJudgment(
+			{ state: ["fallback", crypto.randomUUID()], questions: { tests: QUESTIONS.tests } },
+			{ session: makeSession({ typesafe: true }) },
+		);
+		expect(result.answers).toEqual({ tests: { type: "bool", bool: 1 } });
+		expect(result).toMatchObject({
+			model: "p/smol",
+			selectedModel: "p/smol",
+			primaryModel: "typesafe/jev-preview",
+			fallback: true,
+			cache: "miss",
+			questions: 1,
+			cachedQuestions: 0,
+		});
+		expect(result.responseModel).toBeUndefined();
+		expect(chat).not.toHaveBeenCalled();
+	});
+
+	it("shapes a legacy library answer without inventing provenance", () => {
+		const result = toEvalJudgmentResult({
+			answers: { tests: { type: "noul", noul: 0.4 } },
+			api: "openai-responses",
+			provider: "legacy",
+			model: "display-only",
+			usage: reply("").usage,
+		});
+		expect(result.answers).toEqual({ tests: { type: "bool", bool: 0.4 } });
+		for (const field of [
+			"selectedModel",
+			"primaryModel",
+			"responseModel",
+			"fallback",
+			"cache",
+			"questions",
+			"cachedQuestions",
+		] as const) {
+			expect(result[field]).toBeUndefined();
+		}
 	});
 
 	it("rejects when the chat model answers off-format", async () => {
@@ -168,7 +253,18 @@ describe("eval js judge() prelude", () => {
 		const sandbox: Record<string, unknown> = {
 			__omp_call_tool__: async (name: string, args: unknown) => {
 				calls.push({ name, args });
-				if (name === "__judge__") return { answers: { ok: { type: "bool", bool: 1 } }, model: "p/smol" };
+				if (name === "__judge__") {
+					return {
+						answers: { ok: { type: "bool", bool: 1 } },
+						model: "p/smol",
+						selectedModel: "p/smol",
+						primaryModel: "typesafe/jev-preview",
+						fallback: true,
+						cache: "miss",
+						questions: 1,
+						cachedQuestions: 0,
+					};
+				}
 				throw new Error(`unexpected bridge call ${name}`);
 			},
 		};

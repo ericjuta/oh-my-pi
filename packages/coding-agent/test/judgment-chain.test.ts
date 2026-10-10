@@ -123,6 +123,15 @@ describe("ChainJudge", () => {
 				state: "refactor the scheduler",
 				questions: { level: TIER_QUESTION },
 			});
+			expect(result).toMatchObject({
+				primaryModel: `${LOCAL.provider}/${LOCAL.id}`,
+				selectedModel: `${ONLINE.provider}/${ONLINE.id}`,
+				fallback: true,
+				cache: "miss",
+				questions: 1,
+				cachedQuestions: 0,
+			});
+			expect(result.responseModel).toBeUndefined();
 			return result.answers.level.choice;
 		});
 
@@ -164,6 +173,15 @@ describe("ChainJudge", () => {
 
 		expect(result.answers.level.choice).toBe("high");
 		expect(result.model).toBe("jev-1.13.0");
+		expect(result).toMatchObject({
+			primaryModel: "typesafe/jev-preview",
+			selectedModel: "typesafe/jev-preview",
+			responseModel: "jev-1.13.0",
+			fallback: false,
+			cache: "miss",
+			questions: 1,
+			cachedQuestions: 0,
+		});
 		expect(onUsage).toHaveBeenCalledWith(
 			expect.objectContaining({ role: "typesafe", provider: "typesafe", model: "jev-preview" }),
 		);
@@ -243,9 +261,112 @@ describe("ChainJudge", () => {
 		});
 
 		expect(result.answers.level.choice).toBe("high");
+		expect(result).toMatchObject({
+			primaryModel: "typesafe/jev-preview",
+			selectedModel: "openrouter/~typesafe/jev-latest",
+			responseModel: "jev-1.13.0",
+			fallback: true,
+			cache: "miss",
+			questions: 1,
+			cachedQuestions: 0,
+		});
 		expect(urls).toEqual(["https://judge.example.test/v1/systemone", "https://decisions.example.test/decisions"]);
 		expect(local).not.toHaveBeenCalled();
 		expect(online).not.toHaveBeenCalled();
+	});
+
+	it("reports an upstream-only fallback and retains it while the primary route is cooling down", async () => {
+		const model = {
+			...DECISIONS,
+			id: "vendor/judge-alias",
+			api: "openai-completions",
+			kind: "chat",
+			baseUrl: "https://openrouter.ai/api/v1",
+		} as Model<Api>;
+		const settings = Settings.isolated({
+			modelRoles: { judge: "openrouter/vendor/judge-alias@cerebras" },
+			"retry.fallbackChains": { judge: ["openrouter/vendor/judge-alias@openai"] },
+		});
+		const registry = makeRegistry([model], { openrouter: "or-key" });
+		const upstreams: (string | undefined)[] = [];
+		let rejectPrimary = false;
+		vi.spyOn(ai, "completeSimple").mockImplementation(async (candidate, _context, options) => {
+			const upstream = (candidate.compat as { openRouterRouting?: { only?: string[] } } | undefined)
+				?.openRouterRouting?.only?.[0];
+			upstreams.push(upstream);
+			const response =
+				rejectPrimary && upstream === "cerebras"
+					? { ...reply(candidate, "", "error"), errorMessage: "HTTP 402 Payment Required" }
+					: reply(candidate, "level: high");
+			options?.onAttempt?.(response);
+			return response;
+		});
+		const onUsage = vi.fn();
+		const request = { state: "redesign the scheduler", questions: { level: TIER_QUESTION } };
+		const primary = await new ChainJudge({ settings, registry, purpose: "test", onUsage }).judge(request);
+		expect(primary).toMatchObject({
+			primaryModel: "openrouter/vendor/judge-alias@cerebras",
+			selectedModel: "openrouter/vendor/judge-alias@cerebras",
+			fallback: false,
+		});
+
+		rejectPrimary = true;
+		// First fail over, then resolve a new chain sharing the rejected route's cooldown.
+		for (let attempt = 0; attempt < 2; attempt++) {
+			const attemptsBefore = upstreams.length;
+			const result = await new ChainJudge({ settings, registry, purpose: "test", onUsage }).judge(request);
+			const attemptedUpstreams = upstreams.slice(attemptsBefore);
+			if (attempt === 0) {
+				expect(attemptedUpstreams).toContain("cerebras");
+			} else {
+				expect(attemptedUpstreams).not.toContain("cerebras");
+			}
+			expect(attemptedUpstreams).toContain("openai");
+			expect(result.answers.level.choice).toBe("high");
+			expect(result).toMatchObject({
+				primaryModel: "openrouter/vendor/judge-alias@cerebras",
+				selectedModel: "openrouter/vendor/judge-alias@openai",
+				fallback: true,
+			});
+		}
+		expect(onUsage).toHaveBeenCalledTimes(upstreams.length);
+	});
+
+	it("retains the original primary when an account cooldown skips it on later judgments", async () => {
+		const settings = Settings.isolated({
+			modelRoles: { judge: "typesafe/jev-preview" },
+			"retry.fallbackChains": { judge: ["openrouter/~typesafe/jev-latest"] },
+		});
+		const registry = makeRegistry([JEV_PREVIEW, DECISIONS], { typesafe: "ts-key", openrouter: "or-key" });
+		const urls: string[] = [];
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			asGlobalFetch(async url => {
+				urls.push(String(url));
+				if (String(url).endsWith("/v1/systemone")) return new Response("billing rejected", { status: 402 });
+				return Response.json({
+					model: "jev-serving-version",
+					answers: { level: { type: "choice", choice: "high" } },
+					usage: { input_tokens: 8, output_tokens: 2 },
+				});
+			}),
+		);
+		const onUsage = vi.fn();
+		const request = { state: "redesign the scheduler", questions: { level: TIER_QUESTION } };
+		for (let attempt = 0; attempt < 2; attempt++) {
+			const result = await new ChainJudge({ settings, registry, purpose: "test", onUsage }).judge(request);
+			expect(result).toMatchObject({
+				primaryModel: "typesafe/jev-preview",
+				selectedModel: "openrouter/~typesafe/jev-latest",
+				responseModel: "jev-serving-version",
+				fallback: true,
+			});
+		}
+		expect(urls).toEqual([
+			"https://judge.example.test/v1/systemone",
+			"https://decisions.example.test/decisions",
+			"https://decisions.example.test/decisions",
+		]);
+		expect(onUsage).toHaveBeenCalledTimes(3);
 	});
 
 	it("fails instead of degrading to a prompted model, and skips a rejected account on later calls", async () => {
@@ -409,7 +530,10 @@ describe("ChainJudge", () => {
 		const judge = new ChainJudge({ settings, registry, purpose: "test", onUsage, cache });
 		const question = (instructions: string): NoulQuestion => ({ type: "noul", instructions });
 
-		await judge.judge({ state: { file: "a.ts", body: "x" }, questions: { a: question("A?"), b: question("B?") } });
+		const first = await judge.judge({
+			state: { file: "a.ts", body: "x" },
+			questions: { a: question("A?"), b: question("B?") },
+		});
 		// Same state with reordered keys: only the new question reaches the provider.
 		const second = await judge.judge({
 			state: { body: "x", file: "a.ts" },
@@ -420,6 +544,20 @@ describe("ChainJudge", () => {
 		await judge.judge({ state: { file: "a.ts", body: "x" }, questions: { a: question("A, really?") } });
 
 		expect(sent).toEqual([["a", "b"], ["c"], ["a"]]);
+		expect(first).toMatchObject({ cache: "miss", questions: 2, cachedQuestions: 0 });
+		expect(second).toMatchObject({ cache: "partial", questions: 2, cachedQuestions: 1 });
+		expect(third).toMatchObject({ cache: "hit", questions: 1, cachedQuestions: 1 });
+		for (const result of [first, second, third]) {
+			expect(result).toMatchObject({
+				primaryModel: "typesafe/jev-preview",
+				selectedModel: "typesafe/jev-preview",
+				responseModel: "jev-1.13.0",
+				fallback: false,
+			});
+		}
+		// The compatibility label changes on a hit, not its original raw response identity.
+		expect(first.model).toBe("jev-1.13.0");
+		expect(third.model).toBe("jev-preview");
 		expect(second.answers.b.noul).toBe(0.2);
 		expect(second.usage.input).toBe(10);
 		expect(third.answers.a.noul).toBe(0.9);
@@ -440,6 +578,63 @@ describe("ChainJudge", () => {
 			{ names: "a", price: 0.01 },
 		]);
 		expect(db.query<{ n: number }, []>("SELECT count(*) AS n FROM states").get()?.n).toBe(1);
+	});
+
+	it.each([
+		{ name: "different response models", original: "jev-old", fresh: "jev-new" },
+		{ name: "missing cached origin", original: undefined, fresh: "jev-new" },
+		{ name: "missing fresh origin", original: "jev-old", fresh: undefined },
+	])("keeps mixed cache provenance unknown for $name without inventing fallback", async ({ original, fresh }) => {
+		using tempDir = TempDir.createSync("@omp-judgment-provenance-");
+		const cache = JudgmentCache.open(path.join(tempDir.path(), "judgment-cache.db"));
+		const settings = Settings.isolated({ modelRoles: { judge: "openrouter/~typesafe/jev-latest" } });
+		const registry = makeRegistry([DECISIONS], { openrouter: "or-key" });
+		let calls = 0;
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			asGlobalFetch(async (_url, init) => {
+				const body = JSON.parse(String(init?.body)) as { questions: Record<string, NoulQuestion> };
+				const answers: Record<string, { type: "noul"; noul: number }> = {};
+				for (const id in body.questions) answers[id] = { type: "noul", noul: 0.7 };
+				return Response.json({
+					model: calls++ === 0 ? original : fresh,
+					answers,
+					usage: { input_tokens: 8, output_tokens: 2 },
+				});
+			}),
+		);
+		const onUsage = vi.fn();
+		const judge = new ChainJudge({ settings, registry, purpose: "test", cache, onUsage });
+		const question: NoulQuestion = { type: "noul", instructions: "How relevant is this?" };
+		try {
+			const first = await judge.judge({ state: "same", questions: { a: question } });
+			expect(first.responseModel).toBe(original);
+			const partial = await judge.judge({ state: "same", questions: { a: question, b: question } });
+			const hit = await judge.judge({ state: "same", questions: { a: question, b: question } });
+			expect(partial).toMatchObject({ cache: "partial", questions: 2, cachedQuestions: 1 });
+			expect(hit).toMatchObject({ cache: "hit", questions: 2, cachedQuestions: 2 });
+			for (const result of [partial, hit]) {
+				expect(result.responseModel).toBeUndefined();
+				expect(result).toMatchObject({
+					primaryModel: "openrouter/~typesafe/jev-latest",
+					selectedModel: "openrouter/~typesafe/jev-latest",
+					fallback: false,
+				});
+			}
+			const freshOnly = await judge.judge({ state: "same", questions: { b: question } });
+			expect(freshOnly.responseModel).toBe(fresh);
+			expect(freshOnly.cache).toBe("hit");
+			expect(calls).toBe(2);
+			expect(onUsage).toHaveBeenCalledTimes(2);
+			// Adding another response from the latest model cannot repair unknown/mixed cached origins.
+			const mixedPartial = await judge.judge({
+				state: "same",
+				questions: { a: question, b: question, c: question },
+			});
+			expect(mixedPartial).toMatchObject({ cache: "partial", questions: 3, cachedQuestions: 2 });
+			expect(mixedPartial.responseModel).toBeUndefined();
+		} finally {
+			cache.close();
+		}
 	});
 
 	it("bills a chat-backed judgment once per completion attempt on the ledger and in telemetry", async () => {
@@ -466,6 +661,15 @@ describe("ChainJudge", () => {
 		const result = await judge.judge({ state: "redesign the scheduler", questions: { level: TIER_QUESTION } });
 
 		expect(result.answers.level.choice).toBe("high");
+		expect(result).toMatchObject({
+			primaryModel: `${ONLINE.provider}/${ONLINE.id}`,
+			selectedModel: `${ONLINE.provider}/${ONLINE.id}`,
+			fallback: false,
+			cache: "miss",
+			questions: 1,
+			cachedQuestions: 0,
+		});
+		expect(result.responseModel).toBeUndefined();
 		// Two attempts (initial + format correction): each billed once, never re-billed from the aggregate result.
 		expect(onUsage.mock.calls.map(([usage]) => usage.usage.cost.total)).toEqual([0.01, 0.01]);
 		expect(events.map(event => [event.operation, event.cost])).toEqual([

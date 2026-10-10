@@ -11,7 +11,7 @@
  *
  * ```text
  * states  (id = sha256(canonical state JSON), state)
- * oracle  (id, state → states.id, model, name, type, instruction, criteria, answer)
+ * oracle  (id, state → states.id, model, name, type, instruction, criteria, answer, response_model)
  *         UNIQUE (state, model, name, type, instruction, criteria)
  * usage   (id, state → states.id, results = JSON [oracle.id…], provider, model, tokens, price)
  * ```
@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS oracle (
 	instruction TEXT NOT NULL,
 	criteria TEXT NOT NULL,
 	answer TEXT NOT NULL,
+	response_model TEXT,
 	created_at INTEGER NOT NULL,
 	UNIQUE (state, model, name, type, instruction, criteria)
 );
@@ -73,6 +74,8 @@ export interface CachedAnswers {
 	state: string;
 	/** Answers already known for the request's questions, keyed by question id. */
 	answers: Record<string, Answer>;
+	/** Original raw response model, only when all returned answers have the same known origin. */
+	responseModel?: string;
 }
 
 interface QuestionKey {
@@ -123,16 +126,36 @@ export function sharedJudgmentCache(): JudgmentCache | undefined {
 /** SQLite store of native judgment answers and the billed requests that produced them. */
 export class JudgmentCache {
 	readonly #db: Database;
-	readonly #answer: Statement<{ answer: string }, [string, string, string, string, string, string]>;
+	readonly #answer: Statement<
+		{ answer: string; response_model: string | null },
+		[string, string, string, string, string, string]
+	>;
 	readonly #insertState: Statement<unknown, [string, string, number]>;
 	readonly #upsertOracle: Statement<{ id: number }, [string, string, string, string, string, string, string, number]>;
+	readonly #setResponseModel: Statement<unknown, [string | null, number]>;
 	readonly #insertUsage: Statement<unknown, [string, string, string, string, number, number, number, number]>;
 
 	private constructor(db: Database) {
 		this.#db = db;
 		db.run(SCHEMA);
+		// Lock before inspecting the schema so concurrent openers cannot both add the column.
+		// Legacy origins remain unknown: usage.model is not necessarily the raw response identity.
+		db.transaction(() => {
+			const columns = db.query<{ name: string }, []>("PRAGMA table_info(oracle)").all();
+			if (!columns.some(column => column.name === "response_model")) {
+				db.run("ALTER TABLE oracle ADD COLUMN response_model TEXT");
+			}
+			// Answer writes from older processes cannot retain an origin, even for an unchanged value.
+			db.run(`
+CREATE TRIGGER IF NOT EXISTS oracle_answer_invalidates_response_model
+AFTER UPDATE OF answer ON oracle
+WHEN NEW.response_model IS NOT NULL
+BEGIN
+	UPDATE oracle SET response_model = NULL WHERE id = NEW.id;
+END`);
+		}).immediate();
 		this.#answer = db.prepare(
-			"SELECT answer FROM oracle WHERE state = ? AND model = ? AND name = ? AND type = ? AND instruction = ? AND criteria = ?",
+			"SELECT answer, response_model FROM oracle WHERE state = ? AND model = ? AND name = ? AND type = ? AND instruction = ? AND criteria = ?",
 		);
 		this.#insertState = db.prepare("INSERT OR IGNORE INTO states (id, state, created_at) VALUES (?, ?, ?)");
 		this.#upsertOracle = db.prepare(`
@@ -141,6 +164,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (state, model, name, type, instruction, criteria)
 DO UPDATE SET answer = excluded.answer, created_at = excluded.created_at
 RETURNING id`);
+		this.#setResponseModel = db.prepare("UPDATE oracle SET response_model = ? WHERE id = ?");
 		this.#insertUsage = db.prepare(`
 INSERT INTO usage (state, results, provider, model, input_tokens, output_tokens, price, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
@@ -163,17 +187,28 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
 		const state = stableStringifyJson(request.state);
 		const stateId = new Bun.CryptoHasher("sha256").update(state).digest("hex");
 		const answers: Record<string, Answer> = {};
+		let responseModel: string | undefined;
+		let allOriginsKnown = true;
 		try {
 			for (const name in request.questions) {
 				const key = questionKey(name, request.questions[name]);
 				const row = this.#answer.get(stateId, model, key.name, key.type, key.instruction, key.criteria);
-				if (row) answers[name] = JSON.parse(row.answer);
+				if (row) {
+					answers[name] = JSON.parse(row.answer);
+					if (!row.response_model || (responseModel !== undefined && row.response_model !== responseModel)) {
+						allOriginsKnown = false;
+					} else {
+						responseModel = row.response_model;
+					}
+				}
 			}
 		} catch (error) {
 			logger.warn("judgment cache lookup failed", { error: String(error) });
 			return { stateId, state, answers: {} };
 		}
-		return { stateId, state, answers };
+		const cached: CachedAnswers = { stateId, state, answers };
+		if (allOriginsKnown && responseModel !== undefined) cached.responseModel = responseModel;
+		return cached;
 	}
 
 	/**
@@ -199,7 +234,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
 						JSON.stringify(result.answers[name]),
 						now,
 					);
-					if (row) results.push(row.id);
+					if (row) {
+						// Stamp after answer-trigger invalidation, atomically with the answer and billing row.
+						this.#setResponseModel.run(result.responseModel ?? null, row.id);
+						results.push(row.id);
+					}
 				}
 				this.#insertUsage.run(
 					cached.stateId,

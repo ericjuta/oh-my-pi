@@ -161,7 +161,35 @@ Enabled extension preludes add globals (such as `browser`) with documentation at
 
 `await judge(state, questions)` returns answers keyed by question id. State is a nonempty string, JSON object, or JSON array. Questions have `type: "choice"`, `"bool"`, or `"score"` plus nonempty `instructions`: choice needs at least two label/rubric entries; score needs at least two ordered level descriptions; bool returns a probability in `.bool`, not a boolean. The session's `judge` role resolves the backend.
 
-For many states, Python's `await judge_batch(states, questions, concurrency=32, retries=1, min_ok=1, intent=None)` or JS's `await judgeBatch(states, questions, { concurrency?, retries?, minOk?, intent? })` creates a host-owned batch. States are a list/array (index keys) or keyed object. `await b.drain(...)` pulls newly settled `(key, item)` pairs with `item.answers` or `item.error`; Python takes `timeout` directly, JS takes `{ timeout }`. Item failures are retained, while whole-run failure raises after the drain cursor is exhausted. `status()`, `results()`, `failed()`, `cancel()`, and `close()` inspect/control the batch. Batches outlive cells and kernel resets; `judge_batch.attach(id)` / `judgeBatch.attach(id)` reconnects an owning session until close or owner disposal. Completion and judgment requests share a process-wide 32-request semaphore.
+Judgment is optional: use deterministic checks or direct reading when they better answer the task. There is no minimum item count. Gather necessary source/context and pilot representative cases, including read-only work, before freezing a rubric for a complete pass. Track extraction coverage and exclusions, retain errors and uncertainty, and confirm flagged conclusions against source; neither scores nor the keyword `jevify` grant permission to edit. Grouped judgments, flat judgments, and direct inspection are distinct methods, not interchangeable evidence.
+
+Python's `judge_batch(states, questions, concurrency=32, retries=1, min_ok=1, intent=None)` (without `await`) or JS's `await judgeBatch(states, questions, { concurrency?, retries?, minOk?, intent? })` creates a host-owned batch. States are a list/array (index keys) or keyed object. `await b.drain(...)` pulls newly settled `(key, item)` pairs with `item.answers` or `item.error`; Python takes `timeout` directly, JS takes `{ timeout }`. Item failures are retained, while whole-run failure raises after the drain cursor is exhausted. Completion and judgment requests share a process-wide 32-request semaphore.
+
+#### Per-item provenance
+
+Successful drained items carry provenance alongside `answers`, not inside the answer map. `await judge(...)` still returns only answers; use a one-item batch when a single state needs provenance. Batch `results()` is also answers-only; there is no separate `metadata()` method.
+
+| JavaScript field | Python field | Meaning |
+| --- | --- | --- |
+| `selectedModel` | `selected_model` | Successful configured route, in `provider/id[@upstream]` form. On a cache hit, this is the current route selection, not a new provider response. |
+| `primaryModel` | `primary_model` | First resolved eligible route before cooldown skips or failures, in `provider/id[@upstream]` form. |
+| `fallback` | `fallback` | Whether the selected route differs from the primary route. A response alias differing from the configured model does not imply fallback. |
+| `responseModel` | `response_model` | Explicit response model identity, only when every contributing cached and fresh answer has a known, agreeing identity. Legacy cache records, missing response identity, or mixed identities leave this unknown. Never infer it from `model` or route aliases. |
+| `cache` | `cache` | Local question-cache disposition: `"hit"` when all requested questions were cached, `"miss"` when none were cached, `"partial"` otherwise. Not provider prompt-cache usage. |
+| `questions` | `questions` | Original requested question count, not retry/attempt count. |
+| `cachedQuestions` | `cached_questions` | Number of requested questions served from the local question cache. |
+
+These fields are optional at the bridge boundary; missing metadata is `undefined` in JS and `None` in Python, not proof of primary routing or a cache miss. Failed/cancelled items do not fabricate successful provenance. The existing `item.model` is a compatibility/display label; do not use its frequency across rows to infer primary or fallback routing. Full cache hits reuse saved answers and available response identity without a new provider request or billed usage entry.
+
+#### Lifecycle and recovery
+
+- `status()` snapshots progress; its `model` is the most recently answered item's model, not a batch-wide provenance guarantee. `results()` returns `{key: answers}` for successful items, and `failed()` returns `{key: error}`. Python calls these synchronously; JS awaits them.
+- `cancel()` aborts unfinished work. `close()` cancels if needed and releases the host record; save required evidence before closing.
+- Batches survive cells and Python/JS kernel resets **in the same host process and owning agent session**. Save `b.id`, then use Python's `judge_batch.attach(id)` or JS's `await judgeBatch.attach(id)`. Another owner cannot attach. A new session, session switch, handoff, session reset, `close()`, owner disposal, or process restart releases the batch record and invalidates attachment; a session reset is not a Python/JS kernel reset.
+- Attachment shares the existing host drain cursor; it does not replay items already drained. `results()` and `failed()` can recover their respective snapshots, but answers-only `results()` cannot restore consumed per-item provenance. Persist drained items if that evidence must survive loss of kernel variables.
+- An async completion summary is a progress notification, not the result or provenance store. Consume the batch API directly; recovery does not depend on receiving or parsing a summary event.
+
+These are stock eval contracts. Plugin helpers may persist their own rows, but are not required for the APIs above and cannot make a closed or restarted host batch attachable.
 
 The full helper reference is `xd://eval/judge`.
 

@@ -87,6 +87,8 @@ export function chatTextBackend(model: Model<Api>, options: ChatTextBackendOptio
 					if (typeof answer === "string") text += (text ? " " : "") + answer;
 				}
 			}
+			// AssistantMessage.model is configured identity; upstreamModel may be inferred from
+			// signatures rather than a raw response model. Neither establishes responseModel here.
 			return { text: text.trim(), usage: response.usage };
 		},
 	};

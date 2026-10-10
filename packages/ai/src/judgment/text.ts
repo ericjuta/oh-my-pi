@@ -41,6 +41,8 @@ export interface TextPrompt {
 
 export interface TextCompletion {
 	text: string;
+	/** Raw model identity explicitly reported for this completion, never a configured model fallback. */
+	responseModel?: string;
 	/** Omitted by backends that do not meter tokens (on-device workers). */
 	usage?: Usage;
 }
@@ -298,6 +300,7 @@ export class TextJudge implements Judge {
 					api: this.#backend.api,
 					provider: this.#backend.provider,
 					model: this.#backend.model,
+					...(completion.responseModel?.trim() ? { responseModel: completion.responseModel } : {}),
 					answers: answers as JudgmentResult<Q>["answers"],
 					usage: completion.usage ?? tokenUsage(0, 0),
 				};

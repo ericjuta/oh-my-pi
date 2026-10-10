@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Judgment batch items now expose per-item routing and cache provenance alongside answers, including selected and primary models with upstream pins, fallback use (including upstream-only changes), available response identity, and question/cache counts. Single-state `judge()` and batch `results()` remain answers-only.
+
+### Fixed
+
+- The `jevify` keyword notice now treats Jev as optional: agents can choose deterministic checks or direct reading when better suited, gather necessary source context, and pilot read-only tasks without an arbitrary minimum item count.
+- Corrected eval judgment guidance for Python batch creation and host-local attachment: reattachment shares the drain cursor rather than replaying consumed items, and recovery does not depend on completion summaries.
+
 ## [18.8.7] - 2026-10-09
 
 ### Added

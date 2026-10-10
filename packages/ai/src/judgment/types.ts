@@ -82,10 +82,29 @@ export interface JudgmentRequest<Q extends Questions = Questions> {
 	questions: Q;
 }
 
-export interface JudgmentResult<Q extends Questions = Questions> {
+/** Optional evidence about routing and answer origins; absent fields are unknown, not false or zero. */
+export interface JudgmentProvenance {
+	/** Successful canonical provider/model route, including any account or upstream-routing suffix; not a raw response identity. */
+	selectedModel?: string;
+	/** First resolved eligible canonical provider/model route before cooldowns or failures, including any account or upstream-routing suffix. */
+	primaryModel?: string;
+	/** Explicit raw response model shared by all contributing answers; absent if missing or mixed. */
+	responseModel?: string;
+	/** Whether selectedModel differs from primaryModel; never inferred from responseModel. */
+	fallback?: boolean;
+	/** Application judgment-answer cache status, not provider token-cache usage. */
+	cache?: "hit" | "partial" | "miss";
+	/** Total questions in this judgment request. */
+	questions?: number;
+	/** Questions answered from the application judgment cache. */
+	cachedQuestions?: number;
+}
+
+export interface JudgmentResult<Q extends Questions = Questions> extends JudgmentProvenance {
 	/** Transport that produced the answers (`typesafe`, or the chat model's api). */
 	api: string;
 	provider: string;
+	/** Compatibility/display identity; not evidence of routing, fallback, or a raw response model. */
 	model: string;
 	answers: { [K in keyof Q]: AnswerFor<Q[K]> };
 	usage: Usage;

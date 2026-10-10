@@ -257,6 +257,8 @@ export class ChainJudge implements Judge {
 		let lastFailure: string | undefined;
 		let lastUnavailable: string | undefined;
 		const candidates = this.#resolveCandidates();
+		const primary = candidates[0];
+		if (!primary) throw new Error("judgment: no judge model available");
 		const rejections = this.#rejections();
 		for (const candidate of candidates) {
 			if (signal?.aborted) {
@@ -277,7 +279,7 @@ export class ChainJudge implements Judge {
 					lastUnavailable = `no API key for ${candidate.model.provider}/${candidate.model.id}`;
 					continue;
 				}
-				return await run(judge, kindOf(candidate));
+				return await run(routedJudge(judge, candidate.model, primary.model), kindOf(candidate));
 			} catch (error) {
 				if (signal?.aborted) {
 					throw signal.reason instanceof Error ? signal.reason : new AIError.AbortError("judgment aborted");
@@ -294,7 +296,6 @@ export class ChainJudge implements Judge {
 				});
 			}
 		}
-		if (candidates.length === 0) throw new Error("judgment: no judge model available");
 		throw new Error(`judgment: every judge candidate failed: ${lastFailure ?? lastUnavailable ?? "unknown error"}`);
 	}
 
@@ -372,6 +373,30 @@ export class ChainJudge implements Judge {
 	}
 }
 
+/** Catalog routing is independent of the provider's response identity, including on cache hits. */
+function routedJudge(judge: Judge, selected: Model, primary: Model): Judge {
+	const selectedModel = formatModelStringWithRouting(selected);
+	const primaryModel = formatModelStringWithRouting(primary);
+	return {
+		label: judge.label,
+		async judge<Q extends Questions>(
+			request: JudgmentRequest<Q>,
+			options?: JudgeOptions,
+		): Promise<JudgmentResult<Q>> {
+			const result = await judge.judge(request, options);
+			return {
+				...result,
+				selectedModel,
+				primaryModel,
+				fallback: selectedModel !== primaryModel,
+				cache: result.cache ?? "miss",
+				questions: result.questions ?? Object.keys(request.questions).length,
+				cachedQuestions: result.cachedQuestions ?? 0,
+			};
+		},
+	};
+}
+
 /** Keyword completions through the shared on-device tiny-model worker. */
 class LocalTextBackend implements TextBackend {
 	readonly api = "local-inference";
@@ -434,6 +459,7 @@ function nativeJudge(
 				pending[id] = request.questions[id];
 				pendingCount++;
 			}
+			const cachedQuestions = questions - pendingCount;
 			const attempt = {
 				role: TYPESAFE_PROVIDER,
 				api: judge.api,
@@ -441,7 +467,7 @@ function nativeJudge(
 				model: judge.model,
 				startedAt,
 				questions,
-				cachedQuestions: questions - pendingCount,
+				cachedQuestions,
 			};
 			let fresh: JudgmentResult | undefined;
 			if (pendingCount > 0 || questions === 0) {
@@ -460,7 +486,15 @@ function nativeJudge(
 				if (cache && cached) cache.record(cacheModel, cached, pending, fresh);
 			}
 			const usage = fresh?.usage ?? tokenUsage(0, 0);
-			report({ ...attempt, usage, stopReason: "stop", responseModel: fresh?.model });
+			report({ ...attempt, usage, stopReason: "stop", responseModel: fresh?.responseModel });
+			// A result spanning cached and fresh answers has one response identity only
+			// when every contributing origin is known and agrees.
+			const responseModel =
+				cachedQuestions === 0
+					? fresh?.responseModel
+					: !fresh || fresh.responseModel === cached?.responseModel
+						? cached?.responseModel
+						: undefined;
 			const answers: Record<string, Answer> = {};
 			for (const id in request.questions) {
 				const answer = known[id] ?? fresh?.answers[id];
@@ -470,6 +504,10 @@ function nativeJudge(
 				api: judge.api,
 				provider: judge.provider,
 				model: fresh?.model ?? judge.model,
+				responseModel,
+				cache: cachedQuestions === 0 ? "miss" : pendingCount === 0 ? "hit" : "partial",
+				questions,
+				cachedQuestions,
 				// Every id was answered by the cache or by `fresh`, which TypeSafeJudge validated per question type.
 				answers: answers as JudgmentResult<Q>["answers"],
 				usage,

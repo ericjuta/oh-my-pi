@@ -316,12 +316,20 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 	};
 
 	// One settled judgeBatch item: `answers` on success, else `error`.
+	// Optional provenance is supplied by the host; absent fields remain undefined.
 	class JudgmentItem {
 		constructor(item) {
 			this.key = item.key;
 			this.answers = item.answers;
 			this.error = item.error;
 			this.model = item.model;
+			this.selectedModel = item.selectedModel;
+			this.primaryModel = item.primaryModel;
+			this.responseModel = item.responseModel;
+			this.fallback = item.fallback;
+			this.cache = item.cache;
+			this.questions = item.questions;
+			this.cachedQuestions = item.cachedQuestions;
 		}
 
 		get ok() {
